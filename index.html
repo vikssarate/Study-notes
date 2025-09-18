@@ -43,7 +43,7 @@ a.link{color:#8fb5ff;text-decoration:none}
 .iconbtn{background:#232a48;color:var(--ink);border-radius:10px;padding:6px 10px}
 .icon{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 
-/* Lightbox (scrollable stack) */
+/* Lightbox */
 .lightbox{position:fixed; inset:0; background:rgba(0,0,0,.92); display:none; z-index:9999}
 .lightbox.show{display:block}
 .lightbox-close{
@@ -67,7 +67,6 @@ a.link{color:#8fb5ff;text-decoration:none}
   </h1>
 
   <div class="app">
-    <!-- LEFT -->
     <div class="panel" id="tree">
       <div class="row">
         <input id="newSubject" type="text" placeholder="New subject name"/>
@@ -76,7 +75,6 @@ a.link{color:#8fb5ff;text-decoration:none}
       <div id="subjects"></div>
     </div>
 
-    <!-- RIGHT -->
     <div class="panel details">
       <header>
         <div>
@@ -114,7 +112,7 @@ a.link{color:#8fb5ff;text-decoration:none}
   </div>
 </div>
 
-<!-- Lightbox for image stacks -->
+<!-- Lightbox -->
 <div id="lightbox" class="lightbox" aria-hidden="true">
   <button class="lightbox-close" aria-label="Close">×</button>
   <div class="viewport">
@@ -147,7 +145,7 @@ if ('serviceWorker' in navigator) {
     });
   }
 
-  /* ---------- IndexedDB (SQLite bytes + image blobs) ---------- */
+  /* ---------- IndexedDB ---------- */
   const IDB_NAME = 'study-notes-idb';
   const STORE_SQLITE = 'sqlite';
   const STORE_IMAGES = 'images';
@@ -174,13 +172,12 @@ if ('serviceWorker' in navigator) {
     tx.onsuccess=()=>res(); tx.onerror=()=>rej(tx.error);
   });
 
-  /* ---------- sql.js open ---------- */
+  /* ---------- sql.js ---------- */
   await loadScript(SQLJS_BASE + 'sql-wasm.js');
   const SQL = await window.initSqlJs({ locateFile: f => SQLJS_BASE + f });
   const raw = await idbGet(STORE_SQLITE, 'main');
   const db = raw ? new SQL.Database(raw instanceof Uint8Array ? raw : new Uint8Array(raw)) : new SQL.Database();
 
-  // schema (adds image_pages for multi-page stacks)
   db.exec(`
     PRAGMA foreign_keys=ON;
     create table if not exists subjects(
@@ -206,12 +203,11 @@ if ('serviceWorker' in navigator) {
       scope_id integer not null,
       kind text not null check(kind in ('image','pdf')),
       title text,
-      path text,  -- preview / first page for image notes
-      url text,   -- for PDF links
+      path text,
+      url text,
       created_at integer default (strftime('%s','now'))
     );
     create index if not exists idx_notes_scope on notes(scope,scope_id);
-
     create table if not exists image_pages(
       id integer primary key,
       note_id integer not null references notes(id) on delete cascade,
@@ -222,7 +218,6 @@ if ('serviceWorker' in navigator) {
     );
   `);
 
-  // persistence
   let saveTimer;
   const saveDB = async ()=>{ await idbSet(STORE_SQLITE,'main',db.export()); setStatus('Saved ✓'); };
   const scheduleSave = ()=>{ clearTimeout(saveTimer); saveTimer=setTimeout(saveDB,250); };
@@ -241,12 +236,10 @@ if ('serviceWorker' in navigator) {
     }
   };
 
-  // blob helpers
   const writeBlob = async (path, blob)=> idbSet(STORE_IMAGES, path, blob);
   const rmFile   = async (path)=> idbDel(STORE_IMAGES, path);
-  const readFile = async (path)=> idbGet(STORE_IMAGES, path); // Blob
+  const readFile = async (path)=> idbGet(STORE_IMAGES, path);
 
-  // delete a whole image note with its pages + blobs
   async function deleteImageNoteCascade(noteId){
     const head = driver.select(`select path from notes where id=?`, [noteId])[0];
     if(head?.path) await rmFile(head.path);
@@ -384,7 +377,6 @@ if ('serviceWorker' in navigator) {
         driver.exec(`update subjects set name=? where id=?`, [name,id]); await loadTree();
       } else if(act==='del-subj'){
         if(!confirm('Delete subject and everything under it?')) return;
-        // delete image notes (with their pages) under this subject
         const noteIds = driver.select(`
           select n.id from notes n
           where n.kind='image' and (
@@ -461,18 +453,15 @@ if ('serviceWorker' in navigator) {
     loadNotes();
   });
 
-  // add new image notes (each as a "set" that can hold pages)
   document.getElementById('imgInput').addEventListener('change', async (e)=>{
     if(!details.scope) return;
     for(const f of [...e.target.files]){
       const ext=(f.name.split('.').pop()||'png').toLowerCase();
-      const nidQuery = driver.select(`select ifnull(max(id),0)+1 as next from notes`)[0]; // not strictly needed
       const id = crypto.randomUUID();
       const previewPath=`/images/${details.scope}/${details.id}/${id}.${ext}`;
       await writeBlob(previewPath,f);
       driver.exec(`insert into notes(scope,scope_id,kind,title,path) values(?,?,?,?,?)`,
         [details.scope,details.id,'image',f.name,previewPath]);
-      // Seed first page with previewPath
       const newNoteId = driver.select(`select last_insert_rowid() as id`)[0].id;
       driver.exec(`insert into image_pages(note_id,page,path) values(?,?,?)`, [newNoteId,1,previewPath]);
     }
@@ -482,9 +471,9 @@ if ('serviceWorker' in navigator) {
   const imageList = document.getElementById('imageList');
   const pdfList = document.getElementById('pdfList');
 
-  // Render notes (with pages thumbnails)
   async function loadNotes(){
     imageList.innerHTML=''; pdfList.innerHTML='';
+
     // IMAGE notes
     const imgs = driver.select(`
       select id,title,path from notes
@@ -492,7 +481,6 @@ if ('serviceWorker' in navigator) {
       order by id desc`, [details.scope,details.id]);
 
     for(const r of imgs){
-      // preview = first page path
       let previewPath = r.path;
       const pages = driver.select(`select id,page,path from image_pages where note_id=? order by page asc`, [r.id]);
       if(pages.length) previewPath = pages[0].path;
@@ -514,7 +502,6 @@ if ('serviceWorker' in navigator) {
         </div>`;
       imageList.appendChild(card);
 
-      // Thumbnails
       const thumbs = card.querySelector(`#thumbs-${r.id}`);
       for(const p of pages){
         const b = await readFile(p.path).catch(()=>null);
@@ -545,12 +532,10 @@ if ('serviceWorker' in navigator) {
     }
   }
 
-  // Delegated handlers inside imageList/pdfList
   imageList.addEventListener('change', async (e)=>{
     const fi = e.target.closest('input[type=file][data-act="add-pages"]');
     if(!fi) return;
     const noteId = Number(fi.dataset.id);
-    // current max page
     let next = driver.select(`select coalesce(max(page),0)+1 as n from image_pages where note_id=?`, [noteId])[0].n;
     for(const f of [...fi.files]){
       const ext=(f.name.split('.').pop()||'png').toLowerCase();
@@ -558,7 +543,6 @@ if ('serviceWorker' in navigator) {
       const path=`/images/n${noteId}/${id}.${ext}`;
       await writeBlob(path,f);
       driver.exec(`insert into image_pages(note_id,page,path) values(?,?,?)`, [noteId,next++,path]);
-      // if note had no preview path, set it now
       const head = driver.select(`select path from notes where id=?`, [noteId])[0];
       if(!head.path) driver.exec(`update notes set path=? where id=?`, [path,noteId]);
     }
@@ -580,16 +564,12 @@ if ('serviceWorker' in navigator) {
       }
       return;
     }
-
-    // Thumbnail click -> open stack starting at that page
     if(e.target.matches('.thumbs img')){
       const nId = Number(e.target.dataset.note);
       const pNo = Number(e.target.dataset.page);
       openLightboxForNote(nId, pNo);
       return;
     }
-
-    // Preview click -> open stack from page 1
     if(e.target.matches('img.preview')){
       const nId = Number(noteCard.dataset.noteid);
       openLightboxForNote(nId, 1);
@@ -609,7 +589,7 @@ if ('serviceWorker' in navigator) {
     }
   });
 
-  /* ---------- Lightbox: continuous stack with zoom ---------- */
+  /* ---------- Lightbox ---------- */
   const lbEl = document.getElementById('lightbox');
   const lbStack = document.getElementById('lbStack');
   const lbClose = document.querySelector('.lightbox-close');
@@ -639,28 +619,23 @@ if ('serviceWorker' in navigator) {
       lbStack.appendChild(im);
     }
     lbEl.classList.add('show'); lbEl.setAttribute('aria-hidden','false'); lbZoom=1; lbUpdateZoom();
-    // Scroll to the requested page
     const tgt = document.getElementById(`p${startPage}`);
     if(tgt) tgt.scrollIntoView({block:'start', behavior:'instant'});
   }
 
-  // Double-click / double-tap anywhere on the stack to toggle zoom
   let lastTap=0, tapTimer=null;
   lbStack.addEventListener('click', ()=>{
     const now=Date.now();
     if(now-lastTap<300){ lbZoom = (lbZoom===1? 2.2 : 1); lbUpdateZoom(); lastTap=0; clearTimeout(tapTimer); tapTimer=null; }
     else { lastTap=now; tapTimer=setTimeout(()=>{tapTimer=null;},320); }
   });
-  // Pinch-to-zoom (iOS Safari)
-  let gStart=1;
-  lbStack.addEventListener('gesturestart', e=>{ e.preventDefault(); gStart=lbZoom; });
-  lbStack.addEventListener('gesturechange', e=>{ e.preventDefault(); lbZoom=Math.min(6,Math.max(1,gStart*e.scale)); lbUpdateZoom(); });
+  lbStack.addEventListener('gesturestart', e=>{ e.preventDefault(); });
+  lbStack.addEventListener('gesturechange', e=>{ e.preventDefault(); lbZoom=Math.min(6,Math.max(1,e.scale)); lbUpdateZoom(); });
   lbStack.addEventListener('gestureend', e=>{ e.preventDefault(); });
 
   /* init */
   setStatus('DB: OK (IndexedDB)');
   loadTree();
-  function loadNotes(){ /* placeholder to avoid hoist issues */ } // will be redefined above – keep tools happy
 })();
 </script>
 </body>
