@@ -1,56 +1,102 @@
-// sw.js — Study-notes offline cache
-const CACHE = 'study-notes-v3';
+/* sw.js – Study-notes (SQLite + IndexedDB)
+   - Precaches core assets for offline use
+   - Network-first for HTML (fresh deploys)
+   - Cache-first for static assets (js/wasm/css/img)
+   - Same-origin GET requests only
+*/
 
-// IMPORTANT: these paths are RELATIVE to the repo root where index.html lives
-// and your site is served at https://<user>.github.io/Study-notes/
-const ASSETS = [
-  './',                   // app shell
-  './index.html',         // app shell
-  './lib/sqlite/sqlite3.js',
-  './lib/sqlite/sqlite3.wasm',
-  './lib/sqlite/sqlite3-opfs-async-proxy.js'
+const CACHE_NAME = 'study-notes-v1';
+const CORE_ASSETS = [
+  './',
+  './index.html',
+  './lib/sqljs/sql-wasm.js',
+  './lib/sqljs/sql-wasm.wasm'
 ];
 
-self.addEventListener('install', (evt) => {
-  evt.waitUntil(
-    caches.open(CACHE).then((c) => c.addAll(ASSETS))
+// --- Install: pre-cache core assets ---
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open(CACHE_NAME)
+      .then((cache) => cache.addAll(CORE_ASSETS))
+      .then(() => self.skipWaiting())
+      .catch(() => {}) // ignore if offline on first install
   );
-  self.skipWaiting();
 });
 
-self.addEventListener('activate', (evt) => {
-  evt.waitUntil(
-    caches.keys().then((keys) =>
-      Promise.all(keys.map((k) => (k === CACHE ? null : caches.delete(k))))
-    )
-  );
-  self.clients.claim();
-});
-
-// Cache-first for our assets; network-first (with offline fallback) for navigation
-self.addEventListener('fetch', (evt) => {
-  const req = evt.request;
-
-  // Only handle GET requests inside our scope
-  if (req.method !== 'GET' || new URL(req.url).origin !== self.location.origin) return;
-
-  // App shell fallback for navigations
-  if (req.mode === 'navigate') {
-    evt.respondWith(
-      fetch(req).catch(() => caches.match('./index.html'))
+// --- Activate: clean old caches ---
+self.addEventListener('activate', (event) => {
+  event.waitUntil((async () => {
+    const keys = await caches.keys();
+    await Promise.all(
+      keys
+        .filter((k) => k !== CACHE_NAME && k.startsWith('study-notes-'))
+        .map((k) => caches.delete(k))
     );
+    await self.clients.claim();
+  })());
+});
+
+// Utility: normalize cache key (strip ?v= cache busters)
+function cacheKeyFor(request) {
+  const url = new URL(request.url);
+  // same-origin only
+  if (url.origin !== self.location.origin) return null;
+  url.searchParams.delete('v');
+  return new Request(url.pathname + url.search, {
+    method: 'GET',
+    headers: request.headers,
+    mode: 'same-origin',
+    credentials: 'same-origin',
+  });
+}
+
+// --- Fetch strategy ---
+self.addEventListener('fetch', (event) => {
+  const req = event.request;
+
+  // Only handle same-origin GET
+  if (req.method !== 'GET') return;
+  const url = new URL(req.url);
+  if (url.origin !== self.location.origin) return;
+  if (url.protocol !== 'https:' && url.origin !== 'http://localhost') return;
+  if (url.href.startsWith('blob:')) return;
+
+  // HTML: network-first (fallback to cache)
+  const isHTML =
+    req.destination === 'document' ||
+    req.headers.get('accept')?.includes('text/html');
+
+  if (isHTML) {
+    event.respondWith((async () => {
+      try {
+        const fresh = await fetch(req);
+        const copy = fresh.clone();
+        const key = cacheKeyFor(req);
+        if (key) caches.open(CACHE_NAME).then((c) => c.put(key, copy));
+        return fresh;
+      } catch (_) {
+        const cached = await caches.match(cacheKeyFor(req) || req);
+        return cached || caches.match('./index.html');
+      }
+    })());
     return;
   }
 
-  // Cache-first for static assets
-  evt.respondWith(
-    caches.match(req).then((hit) => hit || fetch(req).then((res) => {
-      const resClone = res.clone();
-      // Store in cache if response is OK
-      if (res.status === 200) {
-        caches.open(CACHE).then((c) => c.put(req, resClone));
-      }
-      return res;
-    }).catch(() => hit)) // if network fails and no hit, just fall through
-  );
+  // Static assets (js/wasm/css/img): cache-first with background refresh
+  const key = cacheKeyFor(req);
+  if (!key) return;
+
+  event.respondWith((async () => {
+    const cache = await caches.open(CACHE_NAME);
+    const cached = await cache.match(key);
+    const networkPromise = fetch(req)
+      .then((res) => {
+        // store/update in cache
+        cache.put(key, res.clone()).catch(() => {});
+        return res;
+      })
+      .catch(() => cached);
+
+    return cached || networkPromise;
+  })());
 });
