@@ -46,6 +46,7 @@ a.link{color:#8fb5ff;text-decoration:none}
   </h1>
 
   <div class="app">
+    <!-- LEFT -->
     <div class="panel" id="tree">
       <div class="row">
         <input id="newSubject" type="text" placeholder="New subject name"/>
@@ -54,6 +55,7 @@ a.link{color:#8fb5ff;text-decoration:none}
       <div id="subjects"></div>
     </div>
 
+    <!-- RIGHT -->
     <div class="panel details">
       <header>
         <div>
@@ -118,18 +120,25 @@ if ('serviceWorker' in navigator) {
     if(!('sqlite3InitModule' in self)) await loadScript(SQLITE_BASE + 'sqlite3.js');
     sqlite3 = await self.sqlite3InitModule({ locateFile: f => SQLITE_BASE + f });
 
-    try {
-      if (sqlite3?.oo1?.OpfsDb) {
-        db = new sqlite3.oo1.OpfsDb('/study-notes/db.sqlite','c'); // persistent
-        mode = 'OPFS';
-      } else {
-        // Some Safari builds hide OpfsDb but allow vfs=opfs
-        db = new sqlite3.oo1.DB('file:/study-notes/db.sqlite?vfs=opfs','c'); // persistent
-        mode = 'opfs vfs';
+    const DB_FILE = 'notes.db';                          // simple, cross-browser friendly
+    const hasOPFS = !!(navigator.storage && navigator.storage.getDirectory);
+
+    if (hasOPFS) {
+      try {
+        if (sqlite3?.oo1?.OpfsDb) {
+          db = new sqlite3.oo1.OpfsDb(DB_FILE,'c');      // persistent
+          mode = 'OPFS';
+        } else {
+          db = new sqlite3.oo1.DB('file:'+DB_FILE+'?vfs=opfs','c'); // persistent
+          mode = 'opfs vfs';
+        }
+      } catch (e) {
+        console.warn('OPFS open failed, using transient DB:', e);
+        db = new sqlite3.oo1.DB('/session.db','c');      // non-persistent fallback
+        mode = 'non-persistent';
       }
-    } catch (e) {
-      console.warn('OPFS open failed, falling back:', e);
-      db = new sqlite3.oo1.DB('/study-notes/db.sqlite','c'); // non-persistent fallback
+    } else {
+      db = new sqlite3.oo1.DB('/session.db','c');        // non-persistent (no OPFS)
       mode = 'non-persistent';
     }
 
@@ -407,7 +416,7 @@ if ('serviceWorker' in navigator) {
   const imageList = document.getElementById('imageList');
   const pdfList = document.getElementById('pdfList');
 
-  // If OPFS is unavailable, disable image uploads gracefully
+  const HAS_OPFS = !!(navigator.storage && navigator.storage.getDirectory);
   if(!HAS_OPFS){
     document.getElementById('imgInput').disabled = true;
     document.querySelector('label[for="imgInput"]').textContent = 'Images disabled (no OPFS)';
