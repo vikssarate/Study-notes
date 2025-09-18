@@ -1,5 +1,6 @@
 // db-worker.js
-import sqlite3InitModule from 'https://unpkg.com/@sqlite.org/sqlite-wasm@3.46.0-build1/sqlite3.mjs';
+
+import sqlite3InitModule from 'https://cdn.jsdelivr.net/npm/@sqlite.org/sqlite-wasm@3.46.0-build1/sqlite3.mjs';
 
 let db, sqlite3;
 
