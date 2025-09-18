@@ -1,0 +1,438 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<title>Subjects → Topics → Chunks — Notes (SQLite + OPFS)</title>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<style>
+:root{
+  --bg:#0f1220;--card:#181c2f;--ink:#eef1ff;--muted:#9aa3c7;--line:#2a3052;
+  --ok:#7bd88f;--warn:#ffd166;--bad:#ff7575;--accent:#6ca8ff
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial}
+.wrap{max-width:1200px;margin:0 auto;padding:12px}
+h1{font-size:18px;margin:0 0 12px}
+.app{display:grid;grid-template-columns: 420px 1fr;gap:16px}
+@media (max-width:960px){.app{grid-template-columns:1fr}}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+input[type=text],input[type=url]{width:100%;padding:10px 12px;border-radius:12px;border:1px solid var(--line);background:#0b1020;color:var(--ink)}
+button{padding:10px 14px;border:0;border-radius:14px;background:var(--accent);color:#081225;font-weight:600;cursor:pointer}
+button.ghost{background:#232a48;color:var(--ink)}
+button.warn{background:var(--bad);color:#200}
+button.slim{padding:6px 10px;border-radius:10px}
+hr{border:0;border-top:1px dashed var(--line);margin:12px 0}
+
+/* Left tree */
+.subject{border:1px dashed var(--line);border-radius:12px;padding:12px;margin:10px 0}
+.subject>header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.subject h2{margin:0;font-size:18px}
+.topic{border:1px dashed var(--line);border-radius:12px;padding:10px;margin:10px 0}
+.topic>header{display:flex;align-items:center;justify-content:space-between}
+.topic h3{margin:0;font-size:16px;cursor:pointer}
+.chunks{margin:8px 0 0 0;display:flex;gap:6px;flex-wrap:wrap}
+.chunk-pill{background:#0e1330;border:1px solid var(--line);padding:6px 10px;border-radius:10px;cursor:pointer}
+
+/* Right details */
+.details header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.tag{font-size:12px;opacity:.8;background:#0b1128;border:1px solid var(--line);padding:2px 8px;border-radius:10px}
+.section{margin-top:8px}
+.scroll-x{display:flex;gap:10px;overflow-x:auto;padding-bottom:8px}
+.card{border:1px solid var(--line);border-radius:12px;padding:8px;background:#0f1530;min-width:180px}
+.card img{display:block;max-height:160px;border-radius:8px}
+.small{font-size:12px;color:var(--muted)}
+input[type=file]{display:none}
+.filelabel{display:inline-block;padding:10px 14px;border-radius:14px;background:var(--ok);color:#102b18;font-weight:700;cursor:pointer}
+a.link{color:#8fb5ff;text-decoration:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Subjects → Topics → Chunks — Notes (SQLite + OPFS)</h1>
+  <div class="app">
+    <!-- LEFT: tree -->
+    <div class="panel" id="tree">
+      <div class="row">
+        <input id="newSubject" type="text" placeholder="New subject name"/>
+        <button id="addSubject">+ Subject</button>
+      </div>
+      <div id="subjects"></div>
+    </div>
+
+    <!-- RIGHT: details -->
+    <div class="panel details" id="details">
+      <header>
+        <div>
+          <div class="tag" id="scopeTag">Nothing selected</div>
+          <h2 id="detailTitle" style="margin:.3rem 0 0 0"></h2>
+        </div>
+        <div class="row" id="renameDeleteBtns" style="display:none">
+          <button class="ghost slim" id="renameBtn">Rename</button>
+          <button class="warn slim" id="deleteBtn">Delete</button>
+        </div>
+      </header>
+
+      <div id="detailBody" style="display:none">
+        <!-- images -->
+        <div class="section">
+          <h3>Image notes</h3>
+          <div class="row">
+            <label class="filelabel" for="imgInput">+ Add images</label>
+            <input id="imgInput" type="file" accept="image/*" multiple/>
+            <span class="small">Images are stored privately in OPFS</span>
+          </div>
+          <div id="imageList" class="scroll-x"></div>
+        </div>
+
+        <hr/>
+
+        <!-- pdf links -->
+        <div class="section">
+          <h3>PDF links</h3>
+          <div class="row">
+            <input id="pdfTitle" type="text" placeholder="PDF title (e.g., Syllabus page)"/>
+            <input id="pdfUrl" type="url" placeholder="https://...pdf"/>
+            <button id="addPdf">+ Link</button>
+          </div>
+          <div id="pdfList"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+/* ---------- DB worker wiring ---------- */
+const worker = new Worker('db-worker.js', {type:'module'});
+let seq=0; const ask = (type,payload={})=>new Promise((res,rej)=>{
+  const id=++seq;
+  const onmsg=(e)=>{ const d=e.data; if(d?.id===id){ worker.removeEventListener('message',onmsg); d.ok?res(d):rej(new Error(d.error)); }};
+  worker.addEventListener('message',onmsg);
+  worker.postMessage({id,type,payload});
+});
+await ask('open');                   // open SQLite (OPFS)
+await ask('migrate');                // ensure schema
+
+/* ---------- OPFS helpers (images live here) ---------- */
+async function opfsRoot(){ return await navigator.storage.getDirectory(); }
+async function ensureDir(dirNames, root){ 
+  let cur = root || await opfsRoot();
+  for(const name of dirNames){
+    cur = await cur.getDirectoryHandle(name,{create:true});
+  }
+  return cur;
+}
+async function writeBlobToOPFS(path, blob){
+  const parts = path.split('/').filter(Boolean);
+  const fileName = parts.pop();
+  const dir = await ensureDir(parts, await opfsRoot());
+  const fh = await dir.getFileHandle(fileName,{create:true});
+  const w = await fh.createWritable(); await w.write(blob); await w.close();
+  return true;
+}
+async function deleteOPFS(path){
+  const parts = path.split('/').filter(Boolean);
+  const fileName = parts.pop();
+  let dir = await opfsRoot();
+  for(const p of parts){ dir = await dir.getDirectoryHandle(p,{create:false}); }
+  await dir.removeEntry(fileName,{recursive:false});
+}
+async function readOPFS(path){
+  const parts = path.split('/').filter(Boolean);
+  const fileName = parts.pop();
+  let dir = await opfsRoot();
+  for(const p of parts){ dir = await dir.getDirectoryHandle(p,{create:false}); }
+  const fh = await dir.getFileHandle(fileName);
+  const file = await fh.getFile();
+  return file;
+}
+
+/* ---------- UI State & Render ---------- */
+const subjectsEl = document.getElementById('subjects');
+const details = {
+  scope:null,   // 'topic' or 'chunk'
+  id:null,
+  titleEl: document.getElementById('detailTitle'),
+  tagEl: document.getElementById('scopeTag'),
+  bodyEl: document.getElementById('detailBody'),
+  renameBtn: document.getElementById('renameBtn'),
+  deleteBtn: document.getElementById('deleteBtn'),
+  buttonsRow: document.getElementById('renameDeleteBtns'),
+  imageList: document.getElementById('imageList'),
+  pdfTitle: document.getElementById('pdfTitle'),
+  pdfUrl: document.getElementById('pdfUrl'),
+  addPdf: document.getElementById('addPdf'),
+  pdfList: document.getElementById('pdfList'),
+  imgInput: document.getElementById('imgInput'),
+};
+function setDetail(scope, id, name){
+  details.scope = scope; details.id = id;
+  details.titleEl.textContent = name || '';
+  details.tagEl.textContent = scope ? `${scope.toUpperCase()} DETAILS` : 'Nothing selected';
+  details.bodyEl.style.display = scope ? '' : 'none';
+  details.buttonsRow.style.display = scope ? '' : 'none';
+  if(scope) { loadNotes(); }
+}
+
+/* Build left tree */
+async function loadTree(){
+  const {rows: subs} = await ask('select', {sql:`select id,name from subjects order by name`});
+  subjectsEl.innerHTML = '';
+  for(const s of subs){
+    const subj = document.createElement('div'); subj.className='subject';
+    subj.innerHTML = `
+      <header>
+        <h2>${escapeHtml(s.name)}</h2>
+        <div class="row">
+          <button class="ghost slim" data-act="rename-subj" data-id="${s.id}">Rename</button>
+          <button class="warn slim" data-act="del-subj" data-id="${s.id}">Delete</button>
+        </div>
+      </header>
+      <div class="row">
+        <input id="topic-input-${s.id}" type="text" placeholder="New topic name"/>
+        <button class="slim" data-act="add-topic" data-id="${s.id}">+ Topic</button>
+      </div>
+      <div id="topic-list-${s.id}"></div>
+    `;
+    subjectsEl.appendChild(subj);
+    await renderTopics(s.id);
+  }
+}
+async function renderTopics(subjectId){
+  const list = document.getElementById(`topic-list-${subjectId}`);
+  const {rows: topics} = await ask('select', {sql:`
+    select t.id,t.name, (select count(*) from chunks c where c.topic_id=t.id) as chunks
+    from topics t where t.subject_id=? order by t.created_at asc`, bind:[subjectId]});
+  list.innerHTML = topics.map(t=>`
+    <div class="topic">
+      <header>
+        <h3 data-act="open-topic" data-id="${t.id}" title="Open notes">${escapeHtml(t.name)} <span class="small">(${t.chunks} chunks)</span></h3>
+        <div class="row">
+          <button class="slim" data-act="add-chunk" data-id="${t.id}">+ Chunk</button>
+          <button class="ghost slim" data-act="rename-topic" data-id="${t.id}">Rename</button>
+          <button class="warn slim" data-act="del-topic" data-id="${t.id}">Delete</button>
+        </div>
+      </header>
+      <div class="chunks" id="chunk-list-${t.id}"></div>
+    </div>
+  `).join('');
+  for(const t of topics){ await renderChunks(t.id); }
+}
+async function renderChunks(topicId){
+  const list = document.getElementById(`chunk-list-${topicId}`);
+  const {rows: chunks} = await ask('select',{sql:`select id,name from chunks where topic_id=? order by created_at asc`, bind:[topicId]});
+  list.innerHTML = chunks.map(c=>`
+    <span class="chunk-pill" title="Open notes" data-act="open-chunk" data-id="${c.id}">${escapeHtml(c.name)}</span>
+    <button class="ghost slim" data-act="rename-chunk" data-id="${c.id}">Rename</button>
+    <button class="warn slim" data-act="del-chunk" data-id="${c.id}">Delete</button>
+  `).join('');
+}
+
+/* Left-tree actions (event delegation) */
+subjectsEl.addEventListener('click', async (e)=>{
+  const btn = e.target.closest('button, h3, span.chunk-pill'); if(!btn) return;
+  const act = btn.dataset.act, id = Number(btn.dataset.id);
+  try{
+    if(act==='rename-subj'){
+      const {rows:[r]} = await ask('select',{sql:`select name from subjects where id=?`, bind:[id]});
+      const name = prompt('Rename subject', r?.name || ''); if(!name) return;
+      await ask('exec',{sql:`update subjects set name=? where id=?`, bind:[name,id]});
+      await loadTree();
+    } else if(act==='del-subj'){
+      if(confirm('Delete subject and everything under it?')){ await ask('exec',{sql:`delete from subjects where id=?`, bind:[id]}); await loadTree(); if(details.scope) setDetail(null,null,''); }
+    } else if(act==='add-topic'){
+      const subjectId = Number(btn.dataset.id);
+      const input = document.getElementById(`topic-input-${subjectId}`);
+      const name = (input.value||'').trim(); if(!name) return;
+      await ask('exec',{sql:`insert into topics(subject_id,name) values(?,?)`, bind:[subjectId,name]});
+      input.value=''; await renderTopics(subjectId);
+    } else if(act==='rename-topic'){
+      const {rows:[r]} = await ask('select',{sql:`select name from topics where id=?`, bind:[id]});
+      const name = prompt('Rename topic', r?.name || ''); if(!name) return;
+      await ask('exec',{sql:`update topics set name=? where id=?`, bind:[name,id]});
+      await loadTree();
+      if(details.scope==='topic' && details.id===id) setDetail('topic', id, name);
+    } else if(act==='del-topic'){
+      if(confirm('Delete topic, its chunks, and notes?')){
+        // also delete its images from OPFS
+        const {rows: imgs} = await ask('select',{sql:`select path from notes where scope='topic' and scope_id=? and kind='image'`, bind:[id]});
+        for(const r of imgs){ try{ await deleteOPFS(r.path); }catch{} }
+        // chunk images too
+        const {rows: chunkImgs} = await ask('select',{sql:`select n.path from notes n where n.kind='image' and n.scope='chunk' and n.scope_id in (select id from chunks where topic_id=?)`, bind:[id]});
+        for(const r of chunkImgs){ try{ await deleteOPFS(r.path); }catch{} }
+        await ask('exec',{sql:`delete from topics where id=?`, bind:[id]});
+        await loadTree(); if(details.scope) setDetail(null,null,'');
+      }
+    } else if(act==='add-chunk'){
+      const topicId = Number(btn.dataset.id);
+      const name = prompt('New chunk name'); if(!name) return;
+      await ask('exec',{sql:`insert into chunks(topic_id,name) values(?,?)`, bind:[topicId,name]});
+      await renderChunks(topicId); await renderTopics((await ask('select',{sql:`select subject_id from topics where id=?`, bind:[topicId]})).rows[0].subject_id);
+    } else if(act==='rename-chunk'){
+      const {rows:[r]} = await ask('select',{sql:`select name,topic_id from chunks where id=?`, bind:[id]});
+      const name = prompt('Rename chunk', r?.name || ''); if(!name) return;
+      await ask('exec',{sql:`update chunks set name=? where id=?`, bind:[name,id]});
+      await renderChunks(r.topic_id);
+      if(details.scope==='chunk' && details.id===id) setDetail('chunk', id, name);
+    } else if(act==='del-chunk'){
+      const {rows:[r]} = await ask('select',{sql:`select topic_id from chunks where id=?`, bind:[id]});
+      if(confirm('Delete this chunk and its notes?')){
+        const {rows: imgs} = await ask('select',{sql:`select path from notes where scope='chunk' and scope_id=? and kind='image'`, bind:[id]});
+        for(const x of imgs){ try{ await deleteOPFS(x.path);}catch{} }
+        await ask('exec',{sql:`delete from chunks where id=?`, bind:[id]});
+        await renderChunks(r.topic_id); if(details.scope) setDetail(null,null,'');
+      }
+    } else if(act==='open-topic'){
+      const {rows:[r]} = await ask('select',{sql:`select name from topics where id=?`, bind:[id]});
+      setDetail('topic', id, r?.name||'Topic');
+    } else if(act==='open-chunk'){
+      const {rows:[r]} = await ask('select',{sql:`select name from chunks where id=?`, bind:[id]});
+      setDetail('chunk', id, r?.name||'Chunk');
+    }
+  }catch(err){ alert(err.message); }
+});
+
+/* Add subject */
+document.getElementById('addSubject').addEventListener('click', async ()=>{
+  const name = (document.getElementById('newSubject').value||'').trim(); if(!name) return;
+  await ask('exec',{sql:`insert into subjects(name) values(?)`, bind:[name]});
+  document.getElementById('newSubject').value=''; loadTree();
+});
+
+/* Detail rename/delete for selected scope */
+details.renameBtn.addEventListener('click', async ()=>{
+  if(!details.scope) return;
+  const {rows:[r]} = await ask('select',{sql:`select name from ${details.scope==='topic'?'topics':'chunks'} where id=?`, bind:[details.id]});
+  const name = prompt('Rename', r?.name || ''); if(!name) return;
+  const tbl = details.scope==='topic'?'topics':'chunks';
+  await ask('exec',{sql:`update ${tbl} set name=? where id=?`, bind:[name,details.id]});
+  details.titleEl.textContent = name; loadTree();
+});
+details.deleteBtn.addEventListener('click', async ()=>{
+  if(!details.scope) return;
+  if(!confirm('Delete this item and its notes?')) return;
+  if(details.scope==='topic'){
+    // delete its images + chunk images
+    const {rows: imgs} = await ask('select',{sql:`select path from notes where scope='topic' and scope_id=? and kind='image'`, bind:[details.id]});
+    for(const r of imgs){ try{ await deleteOPFS(r.path);}catch{} }
+    const {rows: cimgs} = await ask('select',{sql:`select n.path from notes n where n.kind='image' and n.scope='chunk' and n.scope_id in (select id from chunks where topic_id=?)`, bind:[details.id]});
+    for(const r of cimgs){ try{ await deleteOPFS(r.path);}catch{} }
+    await ask('exec',{sql:`delete from topics where id=?`, bind:[details.id]});
+  } else {
+    const {rows: imgs} = await ask('select',{sql:`select path from notes where scope='chunk' and scope_id=? and kind='image'`, bind:[details.id]});
+    for(const r of imgs){ try{ await deleteOPFS(r.path);}catch{} }
+    await ask('exec',{sql:`delete from chunks where id=?`, bind:[details.id]});
+  }
+  setDetail(null,null,''); loadTree();
+});
+
+/* Notes: images */
+details.imgInput.addEventListener('change', async (e)=>{
+  if(!details.scope) return;
+  const files = [...e.target.files];
+  for(const file of files){
+    const ext = file.name.split('.').pop().toLowerCase();
+    const id = crypto.randomUUID();
+    const path = `/images/${details.scope}/${details.id}/${id}.${ext||'png'}`;
+    await writeBlobToOPFS(path, file);
+    await ask('exec',{sql:`insert into notes(scope,scope_id,kind,title,path) values(?,?,?,?,?)`,
+      bind:[details.scope,details.id,'image', file.name, path]});
+  }
+  e.target.value = '';
+  loadNotes();
+});
+
+/* Notes: PDFs */
+details.addPdf.addEventListener('click', async ()=>{
+  if(!details.scope) return;
+  const title = (details.pdfTitle.value||'').trim();
+  const url = (details.pdfUrl.value||'').trim();
+  if(!url){ alert('Add a valid URL'); return; }
+  await ask('exec',{sql:`insert into notes(scope,scope_id,kind,title,url) values(?,?,?,?,?)`,
+    bind:[details.scope,details.id,'pdf', title||'PDF', url]});
+  details.pdfTitle.value=''; details.pdfUrl.value='';
+  loadNotes();
+});
+
+/* Load notes into side panel */
+async function loadNotes(){
+  details.imageList.innerHTML = '';
+  details.pdfList.innerHTML = '';
+  const {rows: imgs} = await ask('select',{sql:`select id,title,path from notes where scope=? and scope_id=? and kind='image' order by id desc`,
+    bind:[details.scope,details.id]});
+  for(const r of imgs){
+    const file = await readOPFS(r.path).catch(()=>null);
+    const url = file ? URL.createObjectURL(file) : '';
+    const div = document.createElement('div'); div.className='card';
+    div.innerHTML = `
+      ${url?`<img src="${url}" alt="${escapeHtml(r.title||'image')}"/>`:`<div class="small">Missing file</div>`}
+      <input type="text" value="${escapeHtml(r.title||'')}" placeholder="Caption" data-note="${r.id}" class="cap"/>
+      <div class="row" style="margin-top:6px">
+        <button class="ghost slim" data-act="save-title" data-id="${r.id}">Save</button>
+        <button class="warn slim" data-act="del-img" data-path="${r.path}" data-id="${r.id}">Delete</button>
+      </div>`;
+    details.imageList.appendChild(div);
+  }
+  const {rows: pdfs} = await ask('select',{sql:`select id,title,url from notes where scope=? and scope_id=? and kind='pdf' order by id desc`,
+    bind:[details.scope,details.id]});
+  for(const r of pdfs){
+    const row = document.createElement('div'); row.className='card';
+    row.innerHTML = `
+      <div class="row" style="justify-content:space-between">
+        <input type="text" value="${escapeHtml(r.title||'PDF')}" data-note="${r.id}" class="pdftitle" style="flex:1"/>
+        <button class="ghost slim" data-act="save-pdf-title" data-id="${r.id}">Save</button>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <input type="url" value="${escapeHtml(r.url||'')}" data-note="${r.id}" class="pdfurl" style="flex:1"/>
+        <a class="link" href="${r.url}" target="_blank" rel="noopener">Open</a>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <button class="warn slim" data-act="del-pdf" data-id="${r.id}">Delete</button>
+      </div>`;
+    details.pdfList.appendChild(row);
+  }
+}
+
+/* Save/del inside details lists */
+details.imageList.addEventListener('click', async (e)=>{
+  const b=e.target.closest('button'); if(!b) return;
+  if(b.dataset.act==='save-title'){
+    const id = Number(b.dataset.id);
+    const inp = b.parentElement.parentElement.querySelector('input.cap');
+    await ask('exec',{sql:`update notes set title=? where id=?`, bind:[inp.value,id]});
+  } else if(b.dataset.act==='del-img'){
+    if(!confirm('Delete image?')) return;
+    try{ await deleteOPFS(b.dataset.path); }catch{}
+    await ask('exec',{sql:`delete from notes where id=?`, bind:[Number(b.dataset.id)]});
+    loadNotes();
+  }
+});
+details.pdfList.addEventListener('click', async (e)=>{
+  const b=e.target.closest('button'); if(!b) return;
+  const id = Number(b.dataset.id);
+  if(b.dataset.act==='save-pdf-title'){
+    const card = b.closest('.card');
+    const title = card.querySelector('input.pdftitle').value;
+    const url = card.querySelector('input.pdfurl').value;
+    await ask('exec',{sql:`update notes set title=?, url=? where id=?`, bind:[title,url,id]});
+  } else if(b.dataset.act==='del-pdf'){
+    if(!confirm('Delete PDF link?')) return;
+    await ask('exec',{sql:`delete from notes where id=?`, bind:[id]});
+    loadNotes();
+  }
+});
+
+/* Helpers */
+function escapeHtml(s){ return (s??'').replace(/[&<>"']/g,m=>({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;" }[m])); }
+
+/* Init */
+await loadTree();
+
+/* Ask for persistent storage (reduces eviction risk) */
+try{ await navigator.storage.persist(); }catch{}
+</script>
+</body>
+</html>
