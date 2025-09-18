@@ -106,7 +106,7 @@ a.link{color:#8fb5ff;text-decoration:none}
 
 <script type="module">
 /* ---------- DB worker wiring ---------- */
-const worker = new Worker('db-worker.js', {type:'module'});
+  const worker = new Worker(new URL('./db-worker.js', import.meta.url), {type:'module'});
 let seq=0; const ask = (type,payload={})=>new Promise((res,rej)=>{
   const id=++seq;
   const onmsg=(e)=>{ const d=e.data; if(d?.id===id){ worker.removeEventListener('message',onmsg); d.ok?res(d):rej(new Error(d.error)); }};
