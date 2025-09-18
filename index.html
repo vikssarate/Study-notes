@@ -19,8 +19,6 @@ input[type=text],input[type=url]{width:100%;padding:10px 12px;border-radius:12px
 button{padding:10px 14px;border:0;border-radius:14px;background:var(--accent);color:#081225;font-weight:600;cursor:pointer}
 button.ghost{background:#232a48;color:var(--ink)} button.warn{background:var(--bad);color:#200} button.slim{padding:6px 10px;border-radius:10px}
 hr{border:0;border-top:1px dashed var(--line);margin:12px 0}
-
-/* Left tree */
 .subject{border:1px dashed var(--line);border-radius:12px;padding:12px;margin:10px 0}
 .subject>header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
 .subject h2{margin:0;font-size:18px}
@@ -29,8 +27,6 @@ hr{border:0;border-top:1px dashed var(--line);margin:12px 0}
 .topic h3{margin:0;font-size:16px;cursor:pointer}
 .chunks{margin:8px 0 0 0;display:flex;gap:6px;flex-wrap:wrap}
 .chunk-pill{background:#0e1330;border:1px solid var(--line);padding:6px 10px;border-radius:10px;cursor:pointer}
-
-/* Right details */
 .details header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
 .section{margin-top:8px}
 .scroll-x{display:flex;gap:10px;overflow-x:auto;padding-bottom:8px}
@@ -50,7 +46,6 @@ a.link{color:#8fb5ff;text-decoration:none}
   </h1>
 
   <div class="app">
-    <!-- LEFT -->
     <div class="panel" id="tree">
       <div class="row">
         <input id="newSubject" type="text" placeholder="New subject name"/>
@@ -59,8 +54,7 @@ a.link{color:#8fb5ff;text-decoration:none}
       <div id="subjects"></div>
     </div>
 
-    <!-- RIGHT -->
-    <div class="panel details" id="details">
+    <div class="panel details">
       <header>
         <div>
           <div class="tag" id="scopeTag">Nothing selected</div>
@@ -98,359 +92,384 @@ a.link{color:#8fb5ff;text-decoration:none}
 </div>
 
 <script type="module">
-/*** ========= DB open: try Worker/ESM → fallback to main thread + UMD ========= ***/
-const statusEl = document.getElementById('dbStatus');
-const CDN_BASE = 'https://cdn.jsdelivr.net/npm/@sqlite.org/sqlite-wasm@3.46.0-build1/';
+(async () => {
+  const statusEl = document.getElementById('dbStatus');
+  const CDN = 'https://cdn.jsdelivr.net/npm/@sqlite.org/sqlite-wasm@3.46.0-build1/';
 
-const withTimeout = (p, ms=6000) => Promise.race([
-  p, new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')), ms))
-]);
+  function loadScript(url){
+    return new Promise((resolve,reject)=>{
+      const s=document.createElement('script'); s.src=url; s.async=true;
+      s.onload=resolve; s.onerror=()=>reject(new Error('script load failed: '+url));
+      document.head.appendChild(s);
+    });
+  }
 
-// Load a non-module script (UMD) – safest path on iOS
-function loadScript(url){
-  return new Promise((resolve, reject)=>{
-    const s = document.createElement('script');
-    s.src = url; s.async = true; s.onload = ()=>resolve(); s.onerror = ()=>reject(new Error('script load failed: '+url));
-    document.head.appendChild(s);
-  });
-}
-
-let driver; // {exec(sql,bind?), select(sql,bind?), kind}
-
-/* 1) Try a module Worker */
-try{
-  const WORKER_SRC = `
-    import sqlite3InitModule from '${CDN_BASE}sqlite3.mjs';
-    let db, sqlite3;
-    onmessage = async (e)=>{
-      const {id,type,payload} = e.data||{};
-      const ok=(d)=>postMessage({id,ok:true,...d}); const fail=(err)=>postMessage({id,ok:false,error:String(err)});
-      try{
-        if(type==='open'){
-          sqlite3 = await sqlite3InitModule({ locateFile: f => '${CDN_BASE}'+f });
-          db = new sqlite3.oo1.OpfsDb('/study-notes/db.sqlite','c');
-          db.exec('pragma foreign_keys=on;'); ok();
-        }else if(type==='migrate'){
-          db.exec(\`
-            create table if not exists subjects(id integer primary key,name text unique not null,created_at integer default (strftime('%s','now')));
-            create table if not exists topics(id integer primary key,subject_id integer not null references subjects(id) on delete cascade,name text not null,created_at integer default (strftime('%s','now')));
-            create table if not exists chunks(id integer primary key,topic_id integer not null references topics(id) on delete cascade,name text not null,created_at integer default (strftime('%s','now')));
-            create table if not exists notes(id integer primary key,scope text not null check(scope in ('topic','chunk')),scope_id integer not null,kind text not null check(kind in ('image','pdf')),title text,path text,url text,created_at integer default (strftime('%s','now')));
-            create index if not exists idx_notes_scope on notes(scope,scope_id);
-          \`); ok();
-        }else if(type==='exec'){
-          if(payload?.bind){ const st=db.prepare(payload.sql); try{ st.bind(payload.bind); st.step(); } finally{ st.free(); } }
-          else db.exec(payload.sql); ok();
-        }else if(type==='select'){
-          const rows=[]; if(payload?.bind){ const st=db.prepare(payload.sql); try{ st.bind(payload.bind); while(st.step()) rows.push(st.get({rowMode:'object'})); } finally{ st.free(); } }
-          else db.exec({sql:payload.sql,rowMode:'object',callback:r=>rows.push(r)}); ok({rows});
-        }else fail('unknown');
-      }catch(err){ fail(err); }
-    };
-  `;
-  const w = new Worker(URL.createObjectURL(new Blob([WORKER_SRC],{type:'text/javascript'})), {type:'module'});
-  let seq=0;
-  const ask = (type,payload={}) => new Promise((resolve,reject)=>{
-    const id=++seq;
-    const onmsg=(e)=>{const d=e.data||{}; if(d.id!==id) return; w.removeEventListener('message',onmsg); d.ok?resolve(d):reject(new Error(d.error)); };
-    w.addEventListener('message',onmsg); w.postMessage({id,type,payload});
-  });
-  await withTimeout(ask('open'));
-  await ask('migrate');
-  driver = { kind:'worker', exec:(sql,bind)=>ask('exec',{sql,bind}), select:(sql,bind)=>ask('select',{sql,bind}).then(d=>d.rows) };
-  statusEl.textContent = 'DB: OK (worker)';
-}catch(err){
-  /* 2) Fallback to main thread + UMD (no module import) */
+  // ---- Open SQLite (UMD) on the main thread ----
+  let sqlite3, db;
   try{
-    statusEl.textContent = 'DB: opening (UMD)…';
-    // Tell UMD where to fetch its .wasm and helper files from:
-    // When sqlite3.js runs it looks for sqlite3.wasm relative to itself. Since we load from CDN_BASE, it's already correct,
-    // but we also pass locateFile to be extra safe.
-    await loadScript(CDN_BASE + 'sqlite3.js');
-    // global appears as self.sqlite3InitModule
-    const sqlite3 = await self.sqlite3InitModule({ locateFile: f => CDN_BASE + f });
-    const db = new sqlite3.oo1.OpfsDb('/study-notes/db.sqlite','c');
+    if(!('sqlite3InitModule' in self)) await loadScript(CDN + 'sqlite3.js');
+    sqlite3 = await self.sqlite3InitModule({ locateFile: f => CDN + f });
+    db = new sqlite3.oo1.OpfsDb('/study-notes/db.sqlite','c');
     db.exec('pragma foreign_keys=on;');
     db.exec(`
-      create table if not exists subjects(id integer primary key,name text unique not null,created_at integer default (strftime('%s','now')));
-      create table if not exists topics(id integer primary key,subject_id integer not null references subjects(id) on delete cascade,name text not null,created_at integer default (strftime('%s','now')));
-      create table if not exists chunks(id integer primary key,topic_id integer not null references topics(id) on delete cascade,name text not null,created_at integer default (strftime('%s','now')));
-      create table if not exists notes(id integer primary key,scope text not null check(scope in ('topic','chunk')),scope_id integer not null,kind text not null check(kind in ('image','pdf')),title text,path text,url text,created_at integer default (strftime('%s','now')));
+      create table if not exists subjects(
+        id integer primary key,
+        name text unique not null,
+        created_at integer default (strftime('%s','now'))
+      );
+      create table if not exists topics(
+        id integer primary key,
+        subject_id integer not null references subjects(id) on delete cascade,
+        name text not null,
+        created_at integer default (strftime('%s','now'))
+      );
+      create table if not exists chunks(
+        id integer primary key,
+        topic_id integer not null references topics(id) on delete cascade,
+        name text not null,
+        created_at integer default (strftime('%s','now'))
+      );
+      create table if not exists notes(
+        id integer primary key,
+        scope text not null check(scope in ('topic','chunk')),
+        scope_id integer not null,
+        kind text not null check(kind in ('image','pdf')),
+        title text,
+        path text,
+        url text,
+        created_at integer default (strftime('%s','now'))
+      );
       create index if not exists idx_notes_scope on notes(scope,scope_id);
     `);
-    driver = {
-      kind:'main-umd',
-      exec: (sql,bind)=>{
-        if(bind){ const st=db.prepare(sql); try{ st.bind(bind); st.step(); } finally{ st.free(); } }
-        else db.exec(sql);
-      },
-      select: (sql,bind)=>{
-        const rows=[]; if(bind){ const st=db.prepare(sql); try{ st.bind(bind); while(st.step()) rows.push(st.get({rowMode:'object'})); } finally{ st.free(); } }
-        else db.exec({sql,rowMode:'object',callback:r=>rows.push(r)}); return rows;
+    statusEl.textContent = 'DB: OK';
+  }catch(e){
+    statusEl.textContent = 'DB error: ' + (e?.message || e);
+    console.error(e);
+    return; // stop, nothing else will work without DB
+  }
+
+  // ---- Tiny DB wrapper ----
+  const driver = {
+    exec(sql, bind){
+      if(bind){
+        const st = db.prepare(sql);
+        try{ st.bind(bind); st.step(); } finally{ st.free(); }
+      } else { db.exec(sql); }
+    },
+    select(sql, bind){
+      const rows = [];
+      if(bind){
+        const st = db.prepare(sql);
+        try{ st.bind(bind); while(st.step()) rows.push(st.get({rowMode:'object'})); }
+        finally{ st.free(); }
+      } else {
+        db.exec({sql, rowMode:'object', callback:r=>rows.push(r)});
       }
-    };
-    statusEl.textContent = 'DB: OK (compat)';
-  }catch(e2){
-    statusEl.textContent = 'DB error: ' + (e2?.message || e2);
-    console.error('DB failed', e2);
+      return rows;
+    }
+  };
+
+  // ---- OPFS helpers (for images) ----
+  async function opfsRoot(){ return await navigator.storage.getDirectory(); }
+  async function ensureDir(parts){ let d=await opfsRoot(); for(const p of parts){ d=await d.getDirectoryHandle(p,{create:true}); } return d; }
+  async function writeBlob(path, blob){
+    const parts = path.split('/').filter(Boolean);
+    const fname = parts.pop();
+    const dir = await ensureDir(parts);
+    const fh = await dir.getFileHandle(fname,{create:true});
+    const w = await fh.createWritable(); await w.write(blob); await w.close();
   }
-}
+  async function rmFile(path){
+    const parts = path.split('/').filter(Boolean);
+    const fname = parts.pop();
+    let d = await opfsRoot();
+    for(const p of parts){ d = await d.getDirectoryHandle(p,{create:false}); }
+    await d.removeEntry(fname).catch(()=>{});
+  }
+  async function readFile(path){
+    const parts = path.split('/').filter(Boolean);
+    const fname = parts.pop();
+    let d = await opfsRoot();
+    for(const p of parts){ d = await d.getDirectoryHandle(p,{create:false}); }
+    const fh = await d.getFileHandle(fname);
+    return await fh.getFile();
+  }
 
-/*** ========= OPFS helpers ========= ***/
-async function opfsRoot(){ return await navigator.storage.getDirectory(); }
-async function ensureDir(parts){ let d=await opfsRoot(); for(const p of parts){ d=await d.getDirectoryHandle(p,{create:true}); } return d; }
-async function writeBlob(path, blob){ const p=path.split('/').filter(Boolean); const f=p.pop(); const d=await ensureDir(p); const fh=await d.getFileHandle(f,{create:true}); const w=await fh.createWritable(); await w.write(blob); await w.close(); }
-async function rmFile(path){ const p=path.split('/').filter(Boolean); const f=p.pop(); let d=await opfsRoot(); for(const s of p){ d=await d.getDirectoryHandle(s,{create:false}); } await d.removeEntry(f).catch(()=>{}); }
-async function readFile(path){ const p=path.split('/').filter(Boolean); const f=p.pop(); let d=await opfsRoot(); for(const s of p){ d=await d.getDirectoryHandle(s,{create:false}); } const fh=await d.getFileHandle(f); return await fh.getFile(); }
+  // ---- UI state ----
+  const subjectsEl = document.getElementById('subjects');
+  const details = {
+    scope:null, id:null,
+    titleEl: document.getElementById('detailTitle'),
+    tagEl: document.getElementById('scopeTag'),
+    bodyEl: document.getElementById('detailBody'),
+    buttonsRow: document.getElementById('renameDeleteBtns'),
+    renameBtn: document.getElementById('renameBtn'),
+    deleteBtn: document.getElementById('deleteBtn'),
+    imgInput: document.getElementById('imgInput'),
+    imageList: document.getElementById('imageList'),
+    pdfTitle: document.getElementById('pdfTitle'),
+    pdfUrl: document.getElementById('pdfUrl'),
+    addPdf: document.getElementById('addPdf'),
+    pdfList: document.getElementById('pdfList'),
+  };
+  const esc = s => (s??'').replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[m]));
 
-/*** ========= App state & UI (unchanged) ========= ***/
-const subjectsEl = document.getElementById('subjects');
-const details = {
-  scope:null, id:null,
-  titleEl: document.getElementById('detailTitle'),
-  tagEl: document.getElementById('scopeTag'),
-  bodyEl: document.getElementById('detailBody'),
-  buttonsRow: document.getElementById('renameDeleteBtns'),
-  renameBtn: document.getElementById('renameBtn'),
-  deleteBtn: document.getElementById('deleteBtn'),
-  imgInput: document.getElementById('imgInput'),
-  imageList: document.getElementById('imageList'),
-  pdfTitle: document.getElementById('pdfTitle'),
-  pdfUrl: document.getElementById('pdfUrl'),
-  addPdf: document.getElementById('addPdf'),
-  pdfList: document.getElementById('pdfList'),
-};
-const esc = s => (s??'').replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[m]) );
-function setDetail(scope,id,name){ details.scope=scope; details.id=id; details.titleEl.textContent=name||''; details.tagEl.textContent=scope?`${scope.toUpperCase()} DETAILS`:'Nothing selected'; details.bodyEl.style.display=scope?'':'none'; details.buttonsRow.style.display=scope?'':'none'; if(scope) loadNotes(); }
+  function setDetail(scope,id,name){
+    details.scope=scope; details.id=id;
+    details.titleEl.textContent = name || '';
+    details.tagEl.textContent = scope ? `${scope.toUpperCase()} DETAILS` : 'Nothing selected';
+    details.bodyEl.style.display = scope ? '' : 'none';
+    details.buttonsRow.style.display = scope ? '' : 'none';
+    if(scope) loadNotes();
+  }
 
-/* Tree renderers */
-async function loadTree(){
-  const subs = await driver.select(`select id,name from subjects order by created_at asc`);
-  subjectsEl.innerHTML='';
-  for(const s of subs){
-    const el=document.createElement('div'); el.className='subject';
-    el.innerHTML=`
-      <header>
-        <h2>${esc(s.name)}</h2>
+  // ---- Render tree ----
+  async function loadTree(){
+    const subs = driver.select(`select id,name from subjects order by created_at asc`);
+    subjectsEl.innerHTML='';
+    for(const s of subs){
+      const el=document.createElement('div'); el.className='subject';
+      el.innerHTML=`
+        <header>
+          <h2>${esc(s.name)}</h2>
+          <div class="row">
+            <button class="ghost slim" data-act="rename-subj" data-id="${s.id}">Rename</button>
+            <button class="warn slim" data-act="del-subj" data-id="${s.id}">Delete</button>
+          </div>
+        </header>
         <div class="row">
-          <button class="ghost slim" data-act="rename-subj" data-id="${s.id}">Rename</button>
-          <button class="warn slim" data-act="del-subj" data-id="${s.id}">Delete</button>
+          <input id="topic-input-${s.id}" type="text" placeholder="New topic name"/>
+          <button class="slim" data-act="add-topic" data-id="${s.id}">+ Topic</button>
         </div>
-      </header>
-      <div class="row">
-        <input id="topic-input-${s.id}" type="text" placeholder="New topic name"/>
-        <button class="slim" data-act="add-topic" data-id="${s.id}">+ Topic</button>
+        <div id="topic-list-${s.id}"></div>`;
+      subjectsEl.appendChild(el);
+      await renderTopics(s.id);
+    }
+  }
+  async function renderTopics(subjectId){
+    const list = document.getElementById(`topic-list-${subjectId}`);
+    const topics = driver.select(`
+      select t.id,t.name,(select count(*) from chunks c where c.topic_id=t.id) as chunks
+      from topics t where t.subject_id=? order by t.created_at asc`, [subjectId]);
+    list.innerHTML = topics.map(t=>`
+      <div class="topic">
+        <header>
+          <h3 data-act="open-topic" data-id="${t.id}">${esc(t.name)} <span class="small">(${t.chunks} chunks)</span></h3>
+          <div class="row">
+            <button class="slim" data-act="add-chunk" data-id="${t.id}">+ Chunk</button>
+            <button class="ghost slim" data-act="rename-topic" data-id="${t.id}">Rename</button>
+            <button class="warn slim" data-act="del-topic" data-id="${t.id}">Delete</button>
+          </div>
+        </header>
+        <div class="chunks" id="chunk-list-${t.id}"></div>
       </div>
-      <div id="topic-list-${s.id}"></div>`;
-    subjectsEl.appendChild(el);
-    await renderTopics(s.id);
+    `).join('');
+    for(const t of topics) await renderChunks(t.id);
   }
-}
-async function renderTopics(subjectId){
-  const list=document.getElementById(`topic-list-${subjectId}`);
-  const topics=await driver.select(`
-    select t.id,t.name,(select count(*) from chunks c where c.topic_id=t.id) as chunks
-    from topics t where t.subject_id=? order by t.created_at asc`, [subjectId]);
-  list.innerHTML=topics.map(t=>`
-    <div class="topic">
-      <header>
-        <h3 data-act="open-topic" data-id="${t.id}">${esc(t.name)} <span class="small">(${t.chunks} chunks)</span></h3>
-        <div class="row">
-          <button class="slim" data-act="add-chunk" data-id="${t.id}">+ Chunk</button>
-          <button class="ghost slim" data-act="rename-topic" data-id="${t.id}">Rename</button>
-          <button class="warn slim" data-act="del-topic" data-id="${t.id}">Delete</button>
-        </div>
-      </header>
-      <div class="chunks" id="chunk-list-${t.id}"></div>
-    </div>`).join('');
-  for(const t of topics){ await renderChunks(t.id); }
-}
-async function renderChunks(topicId){
-  const list=document.getElementById(`chunk-list-${topicId}`);
-  const chunks=await driver.select(`select id,name from chunks where topic_id=? order by created_at asc`, [topicId]);
-  list.innerHTML=chunks.map(c=>`
-    <span class="chunk-pill" data-act="open-chunk" data-id="${c.id}">${esc(c.name)}</span>
-    <button class="ghost slim" data-act="rename-chunk" data-id="${c.id}">Rename</button>
-    <button class="warn slim" data-act="del-chunk" data-id="${c.id}">Delete</button>`).join('');
-}
+  async function renderChunks(topicId){
+    const list = document.getElementById(`chunk-list-${topicId}`);
+    const chunks = driver.select(`select id,name from chunks where topic_id=? order by created_at asc`, [topicId]);
+    list.innerHTML = chunks.map(c=>`
+      <span class="chunk-pill" data-act="open-chunk" data-id="${c.id}">${esc(c.name)}</span>
+      <button class="ghost slim" data-act="rename-chunk" data-id="${c.id}">Rename</button>
+      <button class="warn slim" data-act="del-chunk" data-id="${c.id}">Delete</button>
+    `).join('');
+  }
 
-/* Tree actions */
-subjectsEl.addEventListener('click', async (e)=>{
-  const el=e.target.closest('button,h3,.chunk-pill'); if(!el) return;
-  const act=el.dataset.act, id=Number(el.dataset.id);
-  try{
-    if(act==='add-topic'){
-      const sid=id; const inp=document.getElementById(`topic-input-${sid}`); const name=(inp.value||'').trim(); if(!name) return;
-      await driver.exec(`insert into topics(subject_id,name) values(?,?)`, [sid,name]); inp.value=''; await renderTopics(sid);
-    }else if(act==='rename-subj'){
-      const [{name:old}] = await driver.select(`select name from subjects where id=?`, [id]);
-      const name=prompt('Rename subject', old||''); if(!name) return;
-      await driver.exec(`update subjects set name=? where id=?`, [name,id]); await loadTree();
-    }else if(act==='del-subj'){
-      if(!confirm('Delete subject and EVERYTHING under it?')) return;
-      const tIds = (await driver.select(`select id from topics where subject_id=?`, [id])).map(x=>x.id);
-      if(tIds.length){
-        const imgsT = await driver.select(`select path from notes where kind='image' and scope='topic' and scope_id in (${tIds.map(()=>'?').join(',')})`, tIds);
+  // ---- Left pane events ----
+  subjectsEl.addEventListener('click', async (e)=>{
+    const el = e.target.closest('button, h3, .chunk-pill'); if(!el) return;
+    const act = el.dataset.act, id = Number(el.dataset.id);
+    try{
+      if(act==='add-topic'){
+        const sid=id; const inp=document.getElementById(`topic-input-${sid}`);
+        const name=(inp.value||'').trim(); if(!name) return;
+        driver.exec(`insert into topics(subject_id,name) values(?,?)`, [sid,name]);
+        inp.value=''; await renderTopics(sid);
+      } else if(act==='rename-subj'){
+        const [r] = driver.select(`select name from subjects where id=?`, [id]);
+        const name = prompt('Rename subject', r?.name||''); if(!name) return;
+        driver.exec(`update subjects set name=? where id=?`, [name,id]); await loadTree();
+      } else if(act==='del-subj'){
+        if(!confirm('Delete subject and everything under it?')) return;
+        const tIds = driver.select(`select id from topics where subject_id=?`, [id]).map(x=>x.id);
+        if(tIds.length){
+          const imgsT = driver.select(`select path from notes where kind='image' and scope='topic' and scope_id in (${tIds.map(()=>'?').join(',')})`, tIds);
+          imgsT.forEach(x=>rmFile(x.path));
+          const cIds = driver.select(`select id from chunks where topic_id in (${tIds.map(()=>'?').join(',')})`, tIds).map(x=>x.id);
+          if(cIds.length){
+            const imgsC = driver.select(`select path from notes where kind='image' and scope='chunk' and scope_id in (${cIds.map(()=>'?').join(',')})`, cIds);
+            imgsC.forEach(x=>rmFile(x.path));
+          }
+        }
+        driver.exec(`delete from subjects where id=?`, [id]);
+        await loadTree(); setDetail(null,null,'');
+      } else if(act==='rename-topic'){
+        const [r] = driver.select(`select name,subject_id from topics where id=?`, [id]);
+        const name = prompt('Rename topic', r?.name||''); if(!name) return;
+        driver.exec(`update topics set name=? where id=?`, [name,id]);
+        await renderTopics(r.subject_id);
+        if(details.scope==='topic' && details.id===id) setDetail('topic',id,name);
+      } else if(act==='del-topic'){
+        if(!confirm('Delete topic, its chunks & notes?')) return;
+        const imgsT = driver.select(`select path from notes where scope='topic' and scope_id=? and kind='image'`, [id]);
         imgsT.forEach(x=>rmFile(x.path));
-        const cIds = (await driver.select(`select id from chunks where topic_id in (${tIds.map(()=>'?').join(',')})`, tIds)).map(x=>x.id);
-        if(cIds.length){
-          const imgsC = await driver.select(`select path from notes where kind='image' and scope='chunk' and scope_id in (${cIds.map(()=>'?').join(',')})`, cIds);
+        const cids = driver.select(`select id from chunks where topic_id=?`, [id]).map(x=>x.id);
+        if(cids.length){
+          const imgsC = driver.select(`select path from notes where scope='chunk' and kind='image' and scope_id in (${cids.map(()=>'?').join(',')})`, cids);
           imgsC.forEach(x=>rmFile(x.path));
         }
+        driver.exec(`delete from topics where id=?`, [id]);
+        await loadTree(); setDetail(null,null,'');
+      } else if(act==='add-chunk'){
+        const topicId = id;
+        const name = prompt('New chunk name'); if(!name) return;
+        driver.exec(`insert into chunks(topic_id,name) values(?,?)`, [topicId,name]);
+        await renderChunks(topicId);
+      } else if(act==='rename-chunk'){
+        const [r] = driver.select(`select name,topic_id from chunks where id=?`, [id]);
+        const name = prompt('Rename chunk', r?.name||''); if(!name) return;
+        driver.exec(`update chunks set name=? where id=?`, [name,id]);
+        await renderChunks(r.topic_id);
+        if(details.scope==='chunk' && details.id===id) setDetail('chunk', id, name);
+      } else if(act==='del-chunk'){
+        if(!confirm('Delete this chunk & its notes?')) return;
+        const [r] = driver.select(`select topic_id from chunks where id=?`, [id]);
+        const imgs = driver.select(`select path from notes where scope='chunk' and scope_id=? and kind='image'`, [id]);
+        imgs.forEach(x=>rmFile(x.path));
+        driver.exec(`delete from chunks where id=?`, [id]);
+        await renderChunks(r.topic_id); setDetail(null,null,'');
+      } else if(act==='open-topic'){
+        const [r] = driver.select(`select name from topics where id=?`, [id]);
+        setDetail('topic', id, r?.name||'Topic');
+      } else if(act==='open-chunk'){
+        const [r] = driver.select(`select name from chunks where id=?`, [id]);
+        setDetail('chunk', id, r?.name||'Chunk');
       }
-      await driver.exec(`delete from subjects where id=?`, [id]); await loadTree(); setDetail(null,null,'');
-    }else if(act==='rename-topic'){
-      const [{name:old,subject_id}] = await driver.select(`select name,subject_id from topics where id=?`, [id]);
-      const name=prompt('Rename topic', old||''); if(!name) return;
-      await driver.exec(`update topics set name=? where id=?`, [name,id]); await renderTopics(subject_id); if(details.scope==='topic'&&details.id===id) setDetail('topic',id,name);
-    }else if(act==='del-topic'){
-      if(!confirm('Delete topic, its chunks & notes?')) return;
-      const imgsT = await driver.select(`select path from notes where scope='topic' and scope_id=? and kind='image'`, [id]); imgsT.forEach(x=>rmFile(x.path));
-      const cids = (await driver.select(`select id from chunks where topic_id=?`, [id])).map(x=>x.id);
-      if(cids.length){ const imgsC = await driver.select(`select path from notes where scope='chunk' and kind='image' and scope_id in (${cids.map(()=>'?').join(',')})`, cids); imgsC.forEach(x=>rmFile(x.path)); }
-      await driver.exec(`delete from topics where id=?`, [id]); await loadTree(); setDetail(null,null,'');
-    }else if(act==='add-chunk'){
-      const topicId=id; const name=prompt('New chunk name'); if(!name) return;
-      await driver.exec(`insert into chunks(topic_id,name) values(?,?)`, [topicId,name]); await renderChunks(topicId);
-    }else if(act==='rename-chunk'){
-      const [{name:old,topic_id}] = await driver.select(`select name,topic_id from chunks where id=?`, [id]);
-      const name=prompt('Rename chunk', old||''); if(!name) return;
-      await driver.exec(`update chunks set name=? where id=?`, [name,id]); await renderChunks(topic_id); if(details.scope==='chunk'&&details.id===id) setDetail('chunk',id,name);
-    }else if(act==='del-chunk'){
-      if(!confirm('Delete this chunk & its notes?')) return;
-      const [{topic_id}] = await driver.select(`select topic_id from chunks where id=?`, [id]);
-      const imgs = await driver.select(`select path from notes where scope='chunk' and scope_id=? and kind='image'`, [id]); imgs.forEach(x=>rmFile(x.path));
-      await driver.exec(`delete from chunks where id=?`, [id]); await renderChunks(topic_id); setDetail(null,null,'');
-    }else if(act==='open-topic'){
-      const [{name}] = await driver.select(`select name from topics where id=?`, [id]); setDetail('topic', id, name||'Topic');
-    }else if(act==='open-chunk'){
-      const [{name}] = await driver.select(`select name from chunks where id=?`, [id]); setDetail('chunk', id, name||'Chunk');
+    }catch(err){ alert(err.message); }
+  });
+
+  // ---- Top bar actions ----
+  document.getElementById('addSubject').addEventListener('click', async ()=>{
+    const name=(document.getElementById('newSubject').value||'').trim(); if(!name) return;
+    driver.exec(`insert into subjects(name) values(?)`, [name]);
+    document.getElementById('newSubject').value=''; loadTree();
+  });
+
+  // ---- Detail actions ----
+  const renameBtn = document.getElementById('renameBtn');
+  const deleteBtn = document.getElementById('deleteBtn');
+  renameBtn.addEventListener('click', async ()=>{
+    if(!details.scope) return;
+    const tbl = details.scope==='topic'?'topics':'chunks';
+    const [r] = driver.select(`select name from ${tbl} where id=?`, [details.id]);
+    const name = prompt('Rename', r?.name||''); if(!name) return;
+    driver.exec(`update ${tbl} set name=? where id=?`, [name,details.id]);
+    details.titleEl.textContent = name; loadTree();
+  });
+  deleteBtn.addEventListener('click', async ()=>{
+    if(!details.scope) return;
+    if(details.scope==='topic'){
+      const imgsT = driver.select(`select path from notes where scope='topic' and scope_id=? and kind='image'`, [details.id]); imgsT.forEach(x=>rmFile(x.path));
+      const cids = driver.select(`select id from chunks where topic_id=?`, [details.id]).map(x=>x.id);
+      if(cids.length){ const imgsC = driver.select(`select path from notes where scope='chunk' and kind='image' and scope_id in (${cids.map(()=>'?').join(',')})`, cids); imgsC.forEach(x=>rmFile(x.path)); }
+      driver.exec(`delete from topics where id=?`, [details.id]);
+    } else {
+      const imgs = driver.select(`select path from notes where scope='chunk' and scope_id=? and kind='image'`, [details.id]); imgs.forEach(x=>rmFile(x.path));
+      driver.exec(`delete from chunks where id=?`, [details.id]);
     }
-  }catch(err){ alert(err.message); }
-});
+    setDetail(null,null,''); loadTree();
+  });
 
-/* Add subject */
-document.getElementById('addSubject').addEventListener('click', async ()=>{
-  const name=(document.getElementById('newSubject').value||'').trim(); if(!name) return;
-  await driver.exec(`insert into subjects(name) values(?)`, [name]);
-  document.getElementById('newSubject').value=''; loadTree();
-});
+  // ---- Notes UI ----
+  const imageList = document.getElementById('imageList');
+  const pdfList = document.getElementById('pdfList');
+  document.getElementById('imgInput').addEventListener('change', async (e)=>{
+    if(!details.scope) return;
+    for(const f of [...e.target.files]){
+      const ext=(f.name.split('.').pop()||'png').toLowerCase();
+      const id=crypto.randomUUID();
+      const path=`/images/${details.scope}/${details.id}/${id}.${ext}`;
+      await writeBlob(path,f);
+      driver.exec(`insert into notes(scope,scope_id,kind,title,path) values(?,?,?,?,?)`,
+        [details.scope,details.id,'image',f.name,path]);
+    }
+    e.target.value=''; loadNotes();
+  });
+  document.getElementById('addPdf').addEventListener('click', async ()=>{
+    if(!details.scope) return;
+    const title=(document.getElementById('pdfTitle').value||'').trim()||'PDF';
+    const url=(document.getElementById('pdfUrl').value||'').trim(); if(!url) return alert('Add a valid URL');
+    driver.exec(`insert into notes(scope,scope_id,kind,title,url) values(?,?,?,?,?)`,
+      [details.scope,details.id,'pdf',title,url]);
+    document.getElementById('pdfTitle').value=''; document.getElementById('pdfUrl').value='';
+    loadNotes();
+  });
 
-/* Detail controls */
-const details = Object.assign({}, (()=>{
-  return {
-    scope:null,id:null,
-    titleEl:document.getElementById('detailTitle'),
-    tagEl:document.getElementById('scopeTag'),
-    bodyEl:document.getElementById('detailBody'),
-    buttonsRow:document.getElementById('renameDeleteBtns'),
-    renameBtn:document.getElementById('renameBtn'),
-    deleteBtn:document.getElementById('deleteBtn'),
-    imgInput:document.getElementById('imgInput'),
-    imageList:document.getElementById('imageList'),
-    pdfTitle:document.getElementById('pdfTitle'),
-    pdfUrl:document.getElementById('pdfUrl'),
-    addPdf:document.getElementById('addPdf'),
-    pdfList:document.getElementById('pdfList'),
-  };
-})());
-function setDetail(scope,id,name){ details.scope=scope; details.id=id; details.titleEl.textContent=name||''; details.tagEl.textContent=scope?`${scope.toUpperCase()} DETAILS`:'Nothing selected'; details.bodyEl.style.display=scope?'':'none'; details.buttonsRow.style.display=scope?'':'none'; if(scope) loadNotes(); }
-const esc = s => (s??'').replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[m]));
-
-details.renameBtn.addEventListener('click', async ()=>{
-  if(!details.scope) return;
-  const tbl=details.scope==='topic'?'topics':'chunks';
-  const [{name:old}] = await driver.select(`select name from ${tbl} where id=?`, [details.id]);
-  const name=prompt('Rename', old||''); if(!name) return;
-  await driver.exec(`update ${tbl} set name=? where id=?`, [name,details.id]);
-  details.titleEl.textContent=name; loadTree();
-});
-details.deleteBtn.addEventListener('click', async ()=>{
-  if(!details.scope) return;
-  if(details.scope==='topic'){
-    const imgsT = await driver.select(`select path from notes where scope='topic' and scope_id=? and kind='image'`, [details.id]); imgsT.forEach(x=>rmFile(x.path));
-    const cids=(await driver.select(`select id from chunks where topic_id=?`, [details.id])).map(x=>x.id);
-    if(cids.length){ const imgsC = await driver.select(`select path from notes where scope='chunk' and kind='image' and scope_id in (${cids.map(()=>'?').join(',')})`, cids); imgsC.forEach(x=>rmFile(x.path)); }
-    await driver.exec(`delete from topics where id=?`, [details.id]);
-  }else{
-    const imgs = await driver.select(`select path from notes where scope='chunk' and scope_id=? and kind='image'`, [details.id]); imgs.forEach(x=>rmFile(x.path));
-    await driver.exec(`delete from chunks where id=?`, [details.id]);
+  async function loadNotes(){
+    imageList.innerHTML=''; pdfList.innerHTML='';
+    const imgs = driver.select(`select id,title,path from notes where scope=? and scope_id=? and kind='image' order by id desc`, [details.scope,details.id]);
+    for(const r of imgs){
+      const file = await readFile(r.path).catch(()=>null);
+      const url = file ? URL.createObjectURL(file) : '';
+      const card = document.createElement('div'); card.className='card';
+      card.innerHTML = `
+        ${url?`<img src="${url}" alt="${esc(r.title||'image')}"/>`:`<div class="small">Missing file</div>`}
+        <input type="text" value="${esc(r.title||'')}" placeholder="Caption" class="cap" data-id="${r.id}"/>
+        <div class="row" style="margin-top:6px">
+          <button class="ghost slim" data-act="save-cap" data-id="${r.id}">Save</button>
+          <button class="warn slim" data-act="del-img" data-id="${r.id}" data-path="${r.path}">Delete</button>
+        </div>`;
+      imageList.appendChild(card);
+    }
+    const pdfs = driver.select(`select id,title,url from notes where scope=? and scope_id=? and kind='pdf' order by id desc`, [details.scope,details.id]);
+    for(const r of pdfs){
+      const row=document.createElement('div'); row.className='card';
+      row.innerHTML=`
+        <div class="row" style="justify-content:space-between">
+          <input type="text" class="pdftitle" data-id="${r.id}" value="${esc(r.title||'PDF')}"/>
+          <button class="ghost slim" data-act="save-pdf" data-id="${r.id}">Save</button>
+        </div>
+        <div class="row" style="margin-top:6px">
+          <input type="url" class="pdfurl" data-id="${r.id}" value="${esc(r.url||'')}"/>
+          <a class="link" href="${r.url}" target="_blank" rel="noopener">Open</a>
+        </div>
+        <div class="row" style="margin-top:6px">
+          <button class="warn slim" data-act="del-pdf" data-id="${r.id}">Delete</button>
+        </div>`;
+      pdfList.appendChild(row);
+    }
   }
-  setDetail(null,null,''); loadTree();
-});
+  imageList.addEventListener('click', async (e)=>{
+    const b=e.target.closest('button'); if(!b) return;
+    const id=Number(b.dataset.id);
+    if(b.dataset.act==='save-cap'){
+      const cap=b.parentElement.parentElement.querySelector('input.cap').value;
+      driver.exec(`update notes set title=? where id=?`, [cap,id]);
+    } else if(b.dataset.act==='del-img'){
+      if(!confirm('Delete image?')) return;
+      await rmFile(b.dataset.path);
+      driver.exec(`delete from notes where id=?`, [id]);
+      loadNotes();
+    }
+  });
+  pdfList.addEventListener('click', async (e)=>{
+    const b=e.target.closest('button'); if(!b) return; const id=Number(b.dataset.id);
+    if(b.dataset.act==='save-pdf'){
+      const card=b.closest('.card');
+      const title=card.querySelector('.pdftitle').value;
+      const url=card.querySelector('.pdfurl').value;
+      driver.exec(`update notes set title=?, url=? where id=?`, [title,url,id]);
+    }else if(b.dataset.act==='del-pdf'){
+      if(!confirm('Delete PDF link?')) return;
+      driver.exec(`delete from notes where id=?`, [id]); loadNotes();
+    }
+  });
 
-/* Detail: images */
-details.imgInput.addEventListener('change', async (e)=>{
-  if(!details.scope) return;
-  for(const f of [...e.target.files]){
-    const ext=(f.name.split('.').pop()||'png').toLowerCase();
-    const id=crypto.randomUUID();
-    const path=`/images/${details.scope}/${details.id}/${id}.${ext}`;
-    await writeBlob(path,f);
-    await driver.exec(`insert into notes(scope,scope_id,kind,title,path) values(?,?,?,?,?)`,
-      [details.scope,details.id,'image',f.name,path]);
-  }
-  e.target.value=''; loadNotes();
-});
-
-/* Detail: PDFs */
-details.addPdf.addEventListener('click', async ()=>{
-  if(!details.scope) return;
-  const title=(details.pdfTitle.value||'').trim()||'PDF';
-  const url=(details.pdfUrl.value||'').trim(); if(!url) return alert('Add a valid URL');
-  await driver.exec(`insert into notes(scope,scope_id,kind,title,url) values(?,?,?,?,?)`,
-    [details.scope,details.id,'pdf',title,url]);
-  details.pdfTitle.value=''; details.pdfUrl.value=''; loadNotes();
-});
-
-/* Load notes */
-async function loadNotes(){
-  details.imageList.innerHTML=''; details.pdfList.innerHTML='';
-  const imgs=await driver.select(`select id,title,path from notes where scope=? and scope_id=? and kind='image' order by id desc`, [details.scope,details.id]);
-  for(const r of imgs){
-    const file=await readFile(r.path).catch(()=>null); const url=file?URL.createObjectURL(file):'';
-    const card=document.createElement('div'); card.className='card';
-    card.innerHTML=`
-      ${url?`<img src="${url}" alt="${esc(r.title||'image')}"/>`:`<div class="small">Missing file</div>`}
-      <input type="text" value="${esc(r.title||'')}" placeholder="Caption" class="cap" data-id="${r.id}"/>
-      <div class="row" style="margin-top:6px">
-        <button class="ghost slim" data-act="save-cap" data-id="${r.id}">Save</button>
-        <button class="warn slim" data-act="del-img" data-id="${r.id}" data-path="${r.path}">Delete</button>
-      </div>`;
-    details.imageList.appendChild(card);
-  }
-  const pdfs=await driver.select(`select id,title,url from notes where scope=? and scope_id=? and kind='pdf' order by id desc`, [details.scope,details.id]);
-  for(const r of pdfs){
-    const row=document.createElement('div'); row.className='card';
-    row.innerHTML=`
-      <div class="row" style="justify-content:space-between">
-        <input type="text" class="pdftitle" data-id="${r.id}" value="${esc(r.title||'PDF')}"/>
-        <button class="ghost slim" data-act="save-pdf" data-id="${r.id}">Save</button>
-      </div>
-      <div class="row" style="margin-top:6px">
-        <input type="url" class="pdfurl" data-id="${r.id}" value="${esc(r.url||'')}"/>
-        <a class="link" href="${r.url}" target="_blank" rel="noopener">Open</a>
-      </div>
-      <div class="row" style="margin-top:6px">
-        <button class="warn slim" data-act="del-pdf" data-id="${r.id}">Delete</button>
-      </div>`;
-    details.pdfList.appendChild(row);
-  }
-}
-details.imageList.addEventListener('click', async (e)=>{
-  const b=e.target.closest('button'); if(!b) return; const id=Number(b.dataset.id);
-  if(b.dataset.act==='save-cap'){ const cap=b.parentElement.parentElement.querySelector('input.cap').value; await driver.exec(`update notes set title=? where id=?`, [cap,id]); }
-  else if(b.dataset.act==='del-img'){ if(!confirm('Delete image?')) return; await rmFile(b.dataset.path); await driver.exec(`delete from notes where id=?`, [id]); loadNotes(); }
-});
-details.pdfList.addEventListener('click', async (e)=>{
-  const b=e.target.closest('button'); if(!b) return; const id=Number(b.dataset.id);
-  if(b.dataset.act==='save-pdf'){ const card=b.closest('.card'); const title=card.querySelector('.pdftitle').value; const url=card.querySelector('.pdfurl').value; await driver.exec(`update notes set title=?, url=? where id=?`, [title,url,id]); }
-  else if(b.dataset.act==='del-pdf'){ if(!confirm('Delete PDF link?')) return; await driver.exec(`delete from notes where id=?`, [id]); loadNotes(); }
-});
-
-/* Boot */
-await loadTree();
-try{ await navigator.storage.persist(); }catch{}
+  // initial render
+  loadTree();
+  try{ await navigator.storage.persist(); }catch{}
+})();
 </script>
 </body>
 </html>
