@@ -98,70 +98,77 @@ a.link{color:#8fb5ff;text-decoration:none}
 </div>
 
 <script type="module">
-/*** ========= OPEN DB: try Worker -> fallback to main thread ========= ***/
+/*** ========= DB open: try Worker/ESM → fallback to main thread + UMD ========= ***/
 const statusEl = document.getElementById('dbStatus');
+const CDN_BASE = 'https://cdn.jsdelivr.net/npm/@sqlite.org/sqlite-wasm@3.46.0-build1/';
 
-/* 1) Attempt Worker */
-const WORKER_SRC = `
-  import sqlite3InitModule from 'https://cdn.jsdelivr.net/npm/@sqlite.org/sqlite-wasm@3.46.0-build1/sqlite3.mjs';
-  let db, sqlite3;
-  onmessage = async (e)=>{
-    const {id,type,payload} = e.data||{};
-    const ok=(d)=>postMessage({id,ok:true,...d}); const fail=(err)=>postMessage({id,ok:false,error:String(err)});
-    try{
-      if(type==='open'){
-        const base='https://cdn.jsdelivr.net/npm/@sqlite.org/sqlite-wasm@3.46.0-build1/';
-        sqlite3 = await sqlite3InitModule({ locateFile: f => base + f });
-        db = new sqlite3.oo1.OpfsDb('/study-notes/db.sqlite','c');
-        db.exec('pragma foreign_keys=on;'); ok();
-      }else if(type==='migrate'){
-        db.exec(\`
-          create table if not exists subjects(id integer primary key,name text unique not null,created_at integer default (strftime('%s','now')));
-          create table if not exists topics(id integer primary key,subject_id integer not null references subjects(id) on delete cascade,name text not null,created_at integer default (strftime('%s','now')));
-          create table if not exists chunks(id integer primary key,topic_id integer not null references topics(id) on delete cascade,name text not null,created_at integer default (strftime('%s','now')));
-          create table if not exists notes(id integer primary key,scope text not null check(scope in ('topic','chunk')),scope_id integer not null,kind text not null check(kind in ('image','pdf')),title text,path text,url text,created_at integer default (strftime('%s','now')));
-          create index if not exists idx_notes_scope on notes(scope,scope_id);
-        \`); ok();
-      }else if(type==='exec'){
-        if(payload?.bind){ const st=db.prepare(payload.sql); try{ st.bind(payload.bind); st.step(); } finally{ st.free(); } }
-        else db.exec(payload.sql); ok();
-      }else if(type==='select'){
-        const rows=[]; if(payload?.bind){ const st=db.prepare(payload.sql); try{ st.bind(payload.bind); while(st.step()) rows.push(st.get({rowMode:'object'})); } finally{ st.free(); } }
-        else db.exec({sql:payload.sql,rowMode:'object',callback:r=>rows.push(r)}); ok({rows});
-      }else fail('unknown');
-    }catch(err){ fail(err); }
-  };
-`;
-let driver; // {exec, select, kind}
-
-/* Helper: promise with timeout */
 const withTimeout = (p, ms=6000) => Promise.race([
   p, new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')), ms))
 ]);
 
+// Load a non-module script (UMD) – safest path on iOS
+function loadScript(url){
+  return new Promise((resolve, reject)=>{
+    const s = document.createElement('script');
+    s.src = url; s.async = true; s.onload = ()=>resolve(); s.onerror = ()=>reject(new Error('script load failed: '+url));
+    document.head.appendChild(s);
+  });
+}
+
+let driver; // {exec(sql,bind?), select(sql,bind?), kind}
+
+/* 1) Try a module Worker */
 try{
+  const WORKER_SRC = `
+    import sqlite3InitModule from '${CDN_BASE}sqlite3.mjs';
+    let db, sqlite3;
+    onmessage = async (e)=>{
+      const {id,type,payload} = e.data||{};
+      const ok=(d)=>postMessage({id,ok:true,...d}); const fail=(err)=>postMessage({id,ok:false,error:String(err)});
+      try{
+        if(type==='open'){
+          sqlite3 = await sqlite3InitModule({ locateFile: f => '${CDN_BASE}'+f });
+          db = new sqlite3.oo1.OpfsDb('/study-notes/db.sqlite','c');
+          db.exec('pragma foreign_keys=on;'); ok();
+        }else if(type==='migrate'){
+          db.exec(\`
+            create table if not exists subjects(id integer primary key,name text unique not null,created_at integer default (strftime('%s','now')));
+            create table if not exists topics(id integer primary key,subject_id integer not null references subjects(id) on delete cascade,name text not null,created_at integer default (strftime('%s','now')));
+            create table if not exists chunks(id integer primary key,topic_id integer not null references topics(id) on delete cascade,name text not null,created_at integer default (strftime('%s','now')));
+            create table if not exists notes(id integer primary key,scope text not null check(scope in ('topic','chunk')),scope_id integer not null,kind text not null check(kind in ('image','pdf')),title text,path text,url text,created_at integer default (strftime('%s','now')));
+            create index if not exists idx_notes_scope on notes(scope,scope_id);
+          \`); ok();
+        }else if(type==='exec'){
+          if(payload?.bind){ const st=db.prepare(payload.sql); try{ st.bind(payload.bind); st.step(); } finally{ st.free(); } }
+          else db.exec(payload.sql); ok();
+        }else if(type==='select'){
+          const rows=[]; if(payload?.bind){ const st=db.prepare(payload.sql); try{ st.bind(payload.bind); while(st.step()) rows.push(st.get({rowMode:'object'})); } finally{ st.free(); } }
+          else db.exec({sql:payload.sql,rowMode:'object',callback:r=>rows.push(r)}); ok({rows});
+        }else fail('unknown');
+      }catch(err){ fail(err); }
+    };
+  `;
   const w = new Worker(URL.createObjectURL(new Blob([WORKER_SRC],{type:'text/javascript'})), {type:'module'});
   let seq=0;
   const ask = (type,payload={}) => new Promise((resolve,reject)=>{
     const id=++seq;
-    const onmsg=(e)=>{const d=e.data||{}; if(d.id!==id) return; w.removeEventListener('message',onmsg); d.ok?resolve(d):reject(new Error(d.error));};
+    const onmsg=(e)=>{const d=e.data||{}; if(d.id!==id) return; w.removeEventListener('message',onmsg); d.ok?resolve(d):reject(new Error(d.error)); };
     w.addEventListener('message',onmsg); w.postMessage({id,type,payload});
   });
   await withTimeout(ask('open'));
   await ask('migrate');
-  driver = {
-    kind: 'worker',
-    exec: (sql,bind)=>ask('exec',{sql,bind}),
-    select: (sql,bind)=>ask('select',{sql,bind}).then(d=>d.rows)
-  };
+  driver = { kind:'worker', exec:(sql,bind)=>ask('exec',{sql,bind}), select:(sql,bind)=>ask('select',{sql,bind}).then(d=>d.rows) };
   statusEl.textContent = 'DB: OK (worker)';
 }catch(err){
-  // 2) Fallback to main thread
+  /* 2) Fallback to main thread + UMD (no module import) */
   try{
-    statusEl.textContent = 'DB: opening (no worker)…';
-    const sqlite3InitModule = (await import('https://cdn.jsdelivr.net/npm/@sqlite.org/sqlite-wasm@3.46.0-build1/sqlite3.mjs')).default;
-    const base='https://cdn.jsdelivr.net/npm/@sqlite.org/sqlite-wasm@3.46.0-build1/';
-    const sqlite3 = await sqlite3InitModule({ locateFile: f => base + f });
+    statusEl.textContent = 'DB: opening (UMD)…';
+    // Tell UMD where to fetch its .wasm and helper files from:
+    // When sqlite3.js runs it looks for sqlite3.wasm relative to itself. Since we load from CDN_BASE, it's already correct,
+    // but we also pass locateFile to be extra safe.
+    await loadScript(CDN_BASE + 'sqlite3.js');
+    // global appears as self.sqlite3InitModule
+    const sqlite3 = await self.sqlite3InitModule({ locateFile: f => CDN_BASE + f });
     const db = new sqlite3.oo1.OpfsDb('/study-notes/db.sqlite','c');
     db.exec('pragma foreign_keys=on;');
     db.exec(`
@@ -172,7 +179,7 @@ try{
       create index if not exists idx_notes_scope on notes(scope,scope_id);
     `);
     driver = {
-      kind: 'main',
+      kind:'main-umd',
       exec: (sql,bind)=>{
         if(bind){ const st=db.prepare(sql); try{ st.bind(bind); st.step(); } finally{ st.free(); } }
         else db.exec(sql);
@@ -182,9 +189,9 @@ try{
         else db.exec({sql,rowMode:'object',callback:r=>rows.push(r)}); return rows;
       }
     };
-    statusEl.textContent = 'DB: OK (no worker)';
+    statusEl.textContent = 'DB: OK (compat)';
   }catch(e2){
-    statusEl.textContent = 'DB error: ' + (e2?.message||e2);
+    statusEl.textContent = 'DB error: ' + (e2?.message || e2);
     console.error('DB failed', e2);
   }
 }
@@ -196,7 +203,7 @@ async function writeBlob(path, blob){ const p=path.split('/').filter(Boolean); c
 async function rmFile(path){ const p=path.split('/').filter(Boolean); const f=p.pop(); let d=await opfsRoot(); for(const s of p){ d=await d.getDirectoryHandle(s,{create:false}); } await d.removeEntry(f).catch(()=>{}); }
 async function readFile(path){ const p=path.split('/').filter(Boolean); const f=p.pop(); let d=await opfsRoot(); for(const s of p){ d=await d.getDirectoryHandle(s,{create:false}); } const fh=await d.getFileHandle(f); return await fh.getFile(); }
 
-/*** ========= App state & UI ========= ***/
+/*** ========= App state & UI (unchanged) ========= ***/
 const subjectsEl = document.getElementById('subjects');
 const details = {
   scope:null, id:null,
@@ -329,7 +336,27 @@ document.getElementById('addSubject').addEventListener('click', async ()=>{
   document.getElementById('newSubject').value=''; loadTree();
 });
 
-/* Detail buttons */
+/* Detail controls */
+const details = Object.assign({}, (()=>{
+  return {
+    scope:null,id:null,
+    titleEl:document.getElementById('detailTitle'),
+    tagEl:document.getElementById('scopeTag'),
+    bodyEl:document.getElementById('detailBody'),
+    buttonsRow:document.getElementById('renameDeleteBtns'),
+    renameBtn:document.getElementById('renameBtn'),
+    deleteBtn:document.getElementById('deleteBtn'),
+    imgInput:document.getElementById('imgInput'),
+    imageList:document.getElementById('imageList'),
+    pdfTitle:document.getElementById('pdfTitle'),
+    pdfUrl:document.getElementById('pdfUrl'),
+    addPdf:document.getElementById('addPdf'),
+    pdfList:document.getElementById('pdfList'),
+  };
+})());
+function setDetail(scope,id,name){ details.scope=scope; details.id=id; details.titleEl.textContent=name||''; details.tagEl.textContent=scope?`${scope.toUpperCase()} DETAILS`:'Nothing selected'; details.bodyEl.style.display=scope?'':'none'; details.buttonsRow.style.display=scope?'':'none'; if(scope) loadNotes(); }
+const esc = s => (s??'').replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[m]));
+
 details.renameBtn.addEventListener('click', async ()=>{
   if(!details.scope) return;
   const tbl=details.scope==='topic'?'topics':'chunks';
