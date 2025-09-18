@@ -1,5 +1,5 @@
 // sw.js — Study-notes offline cache
-const CACHE = 'study-notes-v2';
+const CACHE = 'study-notes-v3';
 
 // IMPORTANT: these paths are RELATIVE to the repo root where index.html lives
 // and your site is served at https://<user>.github.io/Study-notes/
