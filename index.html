@@ -46,7 +46,6 @@ a.link{color:#8fb5ff;text-decoration:none}
   </h1>
 
   <div class="app">
-    <!-- LEFT -->
     <div class="panel" id="tree">
       <div class="row">
         <input id="newSubject" type="text" placeholder="New subject name"/>
@@ -55,7 +54,6 @@ a.link{color:#8fb5ff;text-decoration:none}
       <div id="subjects"></div>
     </div>
 
-    <!-- RIGHT -->
     <div class="panel details">
       <header>
         <div>
@@ -93,7 +91,6 @@ a.link{color:#8fb5ff;text-decoration:none}
   </div>
 </div>
 
-<!-- Service worker (optional; safe if sw.js is missing) -->
 <script>
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('./sw.js', { scope: './' })
@@ -106,6 +103,8 @@ if ('serviceWorker' in navigator) {
   const statusEl = document.getElementById('dbStatus');
   const SQLITE_BASE = './lib/sqlite/';
 
+  const set = (t)=>{ statusEl.textContent=t; console.log(t); };
+
   function loadScript(url){
     return new Promise((resolve,reject)=>{
       const s=document.createElement('script'); s.src=url; s.async=true;
@@ -113,16 +112,25 @@ if ('serviceWorker' in navigator) {
       document.head.appendChild(s);
     });
   }
+  const withTimeout = (p, ms, label='timeout') =>
+    Promise.race([p, new Promise((_,rej)=>setTimeout(()=>rej(new Error(label)), ms))]);
 
   // ---------- Open SQLite (robust OPFS + fallbacks) ----------
   let sqlite3, db, mode='?';
   try{
+    set('DB: loading sqlite3.js…');
     if(!('sqlite3InitModule' in self)) await loadScript(SQLITE_BASE + 'sqlite3.js');
-    sqlite3 = await self.sqlite3InitModule({ locateFile: f => SQLITE_BASE + f });
 
-    const DB_FILE = 'notes.db';                          // simple, cross-browser friendly
+    set('DB: loading WASM…');
+    sqlite3 = await withTimeout(
+      self.sqlite3InitModule({ locateFile: f => SQLITE_BASE + f }),
+      10000, 'WASM init timed out'
+    );
+
+    const DB_FILE = 'notes.db';
     const hasOPFS = !!(navigator.storage && navigator.storage.getDirectory);
 
+    set('DB: opening…');
     if (hasOPFS) {
       try {
         if (sqlite3?.oo1?.OpfsDb) {
@@ -138,7 +146,7 @@ if ('serviceWorker' in navigator) {
         mode = 'non-persistent';
       }
     } else {
-      db = new sqlite3.oo1.DB('/session.db','c');        // non-persistent (no OPFS)
+      db = new sqlite3.oo1.DB('/session.db','c');        // non-persistent
       mode = 'non-persistent';
     }
 
@@ -173,7 +181,7 @@ if ('serviceWorker' in navigator) {
       );
       create index if not exists idx_notes_scope on notes(scope,scope_id);
     `);
-    statusEl.textContent = 'DB: OK ('+mode+')';
+    set('DB: OK ('+mode+')');
   }catch(e){
     statusEl.textContent = 'DB error: ' + (e?.message || e);
     console.error(e);
@@ -228,7 +236,7 @@ if ('serviceWorker' in navigator) {
     return await fh.getFile();
   }
 
-  // ---------- UI state ----------
+  // ---------- UI state / render / actions (unchanged) ----------
   const subjectsEl = document.getElementById('subjects');
   const details = {
     scope:null, id:null,
@@ -256,7 +264,6 @@ if ('serviceWorker' in navigator) {
     if(scope) loadNotes();
   }
 
-  // ---------- Render tree ----------
   async function loadTree(){
     const subs = driver.select(`select id,name from subjects order by created_at asc`);
     subjectsEl.innerHTML='';
@@ -309,7 +316,6 @@ if ('serviceWorker' in navigator) {
     `).join('');
   }
 
-  // ---------- Left pane actions ----------
   subjectsEl.addEventListener('click', async (e)=>{
     const el = e.target.closest('button, h3, .chunk-pill'); if(!el) return;
     const act = el.dataset.act, id = Number(el.dataset.id);
@@ -382,14 +388,12 @@ if ('serviceWorker' in navigator) {
     }catch(err){ alert(err.message); }
   });
 
-  // ---------- Top bar ----------
   document.getElementById('addSubject').addEventListener('click', async ()=>{
     const name=(document.getElementById('newSubject').value||'').trim(); if(!name) return;
     driver.exec(`insert into subjects(name) values(?)`, [name]);
     document.getElementById('newSubject').value=''; loadTree();
   });
 
-  // ---------- Detail actions ----------
   document.getElementById('renameBtn').addEventListener('click', async ()=>{
     if(!details.scope) return;
     const tbl = details.scope==='topic'?'topics':'chunks';
@@ -415,7 +419,6 @@ if ('serviceWorker' in navigator) {
   // ---------- Notes UI ----------
   const imageList = document.getElementById('imageList');
   const pdfList = document.getElementById('pdfList');
-
   const HAS_OPFS = !!(navigator.storage && navigator.storage.getDirectory);
   if(!HAS_OPFS){
     document.getElementById('imgInput').disabled = true;
@@ -510,7 +513,6 @@ if ('serviceWorker' in navigator) {
     }
   });
 
-  // initial render
   loadTree();
   try{ await navigator.storage.persist(); }catch{}
 })();
