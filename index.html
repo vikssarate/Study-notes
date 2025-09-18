@@ -41,12 +41,30 @@ a.link{color:#8fb5ff;text-decoration:none}
 .iconbtn{background:#232a48;color:var(--ink);border-radius:10px;padding:6px 10px}
 .icon{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 
-/* Lightbox */
-.lightbox{position:fixed;inset:0;background:rgba(0,0,0,.9);display:none;align-items:center;justify-content:center;z-index:9999}
-.lightbox.show{display:flex}
-.lightbox img{max-width:95vw;max-height:95vh;transition:transform .15s ease;touch-action:none;user-select:none;cursor:zoom-in}
-.lightbox img.zoom{cursor:grab}
-.lightbox-close{position:fixed;top:10px;right:10px;background:#fff;border:0;border-radius:999px;width:36px;height:36px;font-weight:900;cursor:pointer}
+/* Lightbox (scrollable on zoom) */
+.lightbox{
+  position:fixed; inset:0; background:rgba(0,0,0,.92);
+  display:none; z-index:9999;
+}
+.lightbox.show{ display:block; }
+.lightbox-close{
+  position:fixed; top:10px; right:10px;
+  background:#fff; border:0; border-radius:999px;
+  width:36px; height:36px; font-weight:900; cursor:pointer
+}
+.lightbox .viewport{
+  position:absolute; inset:0; overflow:auto;
+  -webkit-overflow-scrolling:touch;
+  display:flex; align-items:center; justify-content:center;
+  padding:16px; touch-action:auto;
+}
+.lightbox img{
+  max-width:95vw; max-height:95vh; display:block;
+  cursor:zoom-in; user-select:none;
+}
+.lightbox.zoomed img{
+  max-width:none; max-height:none; cursor:zoom-out;
+}
 </style>
 </head>
 <body>
@@ -104,13 +122,15 @@ a.link{color:#8fb5ff;text-decoration:none}
   </div>
 </div>
 
-<!-- Lightbox overlay -->
+<!-- Lightbox overlay (scrollable when zoomed) -->
 <div id="lightbox" class="lightbox" aria-hidden="true">
   <button class="lightbox-close" aria-label="Close">×</button>
-  <img id="lightboxImg" alt="note image"/>
+  <div class="viewport">
+    <img id="lightboxImg" alt="note image"/>
+  </div>
 </div>
 
-<!-- (Optional) SW registration — safe if missing -->
+<!-- Optional SW registration -->
 <script>
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('./sw.js', { scope: './' }).catch(()=>{});
@@ -128,6 +148,7 @@ if ('serviceWorker' in navigator) {
     if (ok && t.includes('Saved')) setTimeout(()=>{ statusEl.textContent = 'DB: OK (IndexedDB)'; }, 800);
   };
 
+  /* loader */
   function loadScript(url){
     return new Promise((resolve,reject)=>{
       const s=document.createElement('script'); s.src=url; s.async=true;
@@ -136,11 +157,10 @@ if ('serviceWorker' in navigator) {
     });
   }
 
-  /* ---------- IndexedDB helpers ---------- */
+  /* IndexedDB */
   const IDB_NAME = 'study-notes-idb';
   const STORE_SQLITE = 'sqlite';
   const STORE_IMAGES = 'images';
-
   let idb;
   try{
     idb = await new Promise((resolve,reject)=>{
@@ -168,7 +188,7 @@ if ('serviceWorker' in navigator) {
     tx.onsuccess=()=>res(); tx.onerror=()=>rej(tx.error);
   });
 
-  /* ---------- sql.js DB ---------- */
+  /* sql.js */
   try{
     setStatus('DB: loading sql.js…');
     await loadScript(SQLJS_BASE + 'sql-wasm.js');
@@ -183,7 +203,6 @@ if ('serviceWorker' in navigator) {
 
     const db = dbBytes ? new SQL.Database(dbBytes) : new SQL.Database();
 
-    // schema (idempotent)
     db.exec(`
       create table if not exists subjects(
         id integer primary key,
@@ -218,8 +237,8 @@ if ('serviceWorker' in navigator) {
     let saveTimer;
     async function saveDB(){
       try{
-        const data = db.export();
-        await idbSet(STORE_SQLITE, 'main', data);
+        const data = db.export();                 // Uint8Array
+        await idbSet(STORE_SQLITE, 'main', data); // store as Uint8Array
         setStatus('Saved ✓');
       }catch(e){ console.error(e); setStatus('Save failed', false); }
     }
@@ -240,12 +259,12 @@ if ('serviceWorker' in navigator) {
       }
     };
 
-    /* ---------- Images in IDB ---------- */
+    /* image blobs in IDB */
     async function writeBlob(path, blob){ await idbSet(STORE_IMAGES, path, blob); }
     async function rmFile(path){ await idbDel(STORE_IMAGES, path); }
-    async function readFile(path){ return await idbGet(STORE_IMAGES, path); }
+    async function readFile(path){ return await idbGet(STORE_IMAGES, path); } // Blob
 
-    /* ---------- Collapse state (persisted) ---------- */
+    /* collapse state */
     const collapsed = {
       subjects: new Set(JSON.parse(localStorage.getItem('coll-subjects')||'[]')),
       topics:   new Set(JSON.parse(localStorage.getItem('coll-topics')||'[]'))
@@ -255,7 +274,7 @@ if ('serviceWorker' in navigator) {
       localStorage.setItem('coll-topics',   JSON.stringify([...collapsed.topics]));
     };
 
-    /* ---------- UI refs ---------- */
+    /* UI refs */
     const subjectsEl = document.getElementById('subjects');
     const details = {
       scope:null, id:null,
@@ -283,7 +302,7 @@ if ('serviceWorker' in navigator) {
       if(scope) loadNotes();
     }
 
-    /* ---------- Render tree (with collapsible UI) ---------- */
+    /* render tree */
     async function loadTree(){
       const subs = driver.select(`select id,name from subjects order by created_at asc`);
       subjectsEl.innerHTML='';
@@ -354,7 +373,7 @@ if ('serviceWorker' in navigator) {
       `).join('');
     }
 
-    /* ---------- Left pane actions (incl. collapse) ---------- */
+    /* left pane actions */
     subjectsEl.addEventListener('click', async (e)=>{
       const el = e.target.closest('button, h3, .chunk-pill'); if(!el) return;
       const act = el.dataset.act, id = Number(el.dataset.id);
@@ -441,7 +460,7 @@ if ('serviceWorker' in navigator) {
       }catch(err){ alert(err.message); }
     });
 
-    /* ---------- Top bar actions ---------- */
+    /* top bar */
     const addSubject = () => {
       const name=(document.getElementById('newSubject').value||'').trim(); if(!name) return;
       driver.exec(`insert into subjects(name) values(?)`, [name]);
@@ -452,7 +471,7 @@ if ('serviceWorker' in navigator) {
       if(e.key==='Enter') addSubject();
     });
 
-    /* ---------- Detail actions ---------- */
+    /* detail actions */
     document.getElementById('renameBtn').addEventListener('click', async ()=>{
       if(!details.scope) return;
       const tbl = details.scope==='topic'?'topics':'chunks';
@@ -475,7 +494,7 @@ if ('serviceWorker' in navigator) {
       setDetail(null,null,''); loadTree();
     });
 
-    /* ---------- Notes UI + Lightbox ---------- */
+    /* notes + lightbox */
     const imageList = document.getElementById('imageList');
     const pdfList = document.getElementById('pdfList');
 
@@ -571,62 +590,75 @@ if ('serviceWorker' in navigator) {
       }
     });
 
-    /* ---------- Lightbox (tap to zoom + drag when zoomed) ---------- */
+    /* Lightbox (tap to zoom + scroll when zoomed) */
     const lb = {
       el: document.getElementById('lightbox'),
+      vp: document.querySelector('#lightbox .viewport'),
       img: document.getElementById('lightboxImg'),
       closeBtn: document.querySelector('.lightbox-close'),
-      zoom: 1, tx: 0, ty: 0, dragging: false, px:0, py:0
+      zoom: 1
     };
-    function openLightbox(src, alt){
-      lb.img.src = src; lb.img.alt = alt||'';
-      lb.zoom = 1; lb.tx=lb.ty=0; lb.img.style.transform = 'translate(0px,0px) scale(1)';
-      lb.img.classList.remove('zoom');
-      lb.el.classList.add('show'); lb.el.setAttribute('aria-hidden','false');
-    }
-    function closeLightbox(){
-      lb.el.classList.remove('show'); lb.el.setAttribute('aria-hidden','true');
-      lb.img.src=''; lb.img.classList.remove('zoom');
-    }
-    lb.closeBtn.addEventListener('click', closeLightbox);
-    lb.el.addEventListener('click', (e)=>{ if(e.target===lb.el) closeLightbox(); });
-    document.addEventListener('keydown', (e)=>{ if(e.key==='Escape') closeLightbox(); });
 
-    // toggle zoom on double-tap/click
-    let tapTimer=null, lastTap=0;
-    lb.img.addEventListener('click', (e)=>{
-      const now=Date.now();
-      if(now-lastTap<300){ // double tap
-        if(lb.zoom===1){ lb.zoom=2.2; lb.img.classList.add('zoom'); lb.img.style.cursor='grab'; }
-        else{ lb.zoom=1; lb.tx=lb.ty=0; lb.img.classList.remove('zoom'); }
-        lb.img.style.transform = `translate(${lb.tx}px,${lb.ty}px) scale(${lb.zoom})`;
-        lastTap=0; clearTimeout(tapTimer); tapTimer=null; return;
+    function updateZoom() {
+      if (lb.zoom === 1) {
+        lb.el.classList.remove('zoomed');
+        lb.img.style.width = '';
+        lb.img.style.height = '';
+        lb.img.style.cursor = 'zoom-in';
+        lb.vp.scrollTop = lb.vp.scrollLeft = 0;
+      } else {
+        lb.el.classList.add('zoomed');
+        const w = lb.img.naturalWidth  * lb.zoom;
+        lb.img.style.width  = Math.round(w) + 'px';
+        lb.img.style.height = 'auto';
+        lb.img.style.cursor = 'zoom-out';
       }
-      lastTap=now;
-      tapTimer=setTimeout(()=>{ tapTimer=null; }, 320);
+    }
+
+    function openLightbox(src, alt) {
+      lb.img.onload = () => { lb.zoom = 1; updateZoom(); };
+      lb.img.src = src;
+      lb.img.alt = alt || '';
+      lb.el.classList.add('show');
+      lb.el.setAttribute('aria-hidden','false');
+    }
+
+    function closeLightbox() {
+      lb.el.classList.remove('show','zoomed');
+      lb.el.setAttribute('aria-hidden','true');
+      lb.img.src = '';
+      lb.zoom = 1;
+    }
+
+    lb.closeBtn.addEventListener('click', closeLightbox);
+    lb.el.addEventListener('click', (e)=>{ if (e.target === lb.el) closeLightbox(); });
+    document.addEventListener('keydown', (e)=>{ if(e.key === 'Escape') closeLightbox(); });
+
+    // Double-tap / double-click to toggle zoom (1x <-> 2.2x)
+    let lastTap = 0, tapTimer = null;
+    lb.img.addEventListener('click', ()=>{
+      const now = Date.now();
+      if (now - lastTap < 300) {
+        lb.zoom = (lb.zoom === 1) ? 2.2 : 1;
+        updateZoom();
+        lastTap = 0; clearTimeout(tapTimer); tapTimer = null; 
+      } else {
+        lastTap = now;
+        tapTimer = setTimeout(()=>{ tapTimer=null; }, 320);
+      }
     });
 
-    // drag to pan when zoomed
-    lb.img.addEventListener('pointerdown', (e)=>{
-      if(lb.zoom===1) return;
-      lb.dragging=true; lb.px=e.clientX; lb.py=e.clientY;
-      lb.img.setPointerCapture(e.pointerId); lb.img.style.cursor='grabbing';
+    // (Optional) pinch to zoom on iOS Safari
+    let gestureStartZoom = 1;
+    lb.img.addEventListener('gesturestart', (e)=>{ e.preventDefault(); gestureStartZoom = lb.zoom; });
+    lb.img.addEventListener('gesturechange', (e)=>{
+      e.preventDefault();
+      lb.zoom = Math.min(6, Math.max(1, gestureStartZoom * e.scale));
+      updateZoom();
     });
-    lb.img.addEventListener('pointermove', (e)=>{
-      if(!lb.dragging) return;
-      const dx = e.clientX - lb.px, dy = e.clientY - lb.py;
-      lb.px = e.clientX; lb.py = e.clientY;
-      lb.tx += dx; lb.ty += dy;
-      lb.img.style.transform = `translate(${lb.tx}px,${lb.ty}px) scale(${lb.zoom})`;
-    });
-    lb.img.addEventListener('pointerup', ()=>{
-      lb.dragging=false; lb.img.style.cursor='grab';
-    });
-    lb.img.addEventListener('pointercancel', ()=>{
-      lb.dragging=false; lb.img.style.cursor='grab';
-    });
+    lb.img.addEventListener('gestureend', (e)=>{ e.preventDefault(); });
 
-    /* ---------- init ---------- */
+    /* init */
     setStatus('DB: OK (IndexedDB)');
     loadTree();
     addEventListener('pagehide', saveDB, {capture:true});
