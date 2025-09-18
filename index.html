@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
-<title>Subjects → Topics → Chunks — Notes (SQLite WASM + OPFS)</title>
+<title>Subjects → Topics → Chunks — Notes (SQLite + IndexedDB)</title>
 <meta name="apple-mobile-web-app-capable" content="yes"/>
 <style>
 :root{--bg:#0f1220;--card:#181c2f;--ink:#eef1ff;--muted:#9aa3c7;--line:#2a3052;--ok:#7bd88f;--bad:#ff7575;--accent:#6ca8ff}
@@ -41,11 +41,12 @@ a.link{color:#8fb5ff;text-decoration:none}
 <body>
 <div class="wrap">
   <h1>
-    Subjects → Topics → Chunks — Notes (SQLite WASM + OPFS)
+    Subjects → Topics → Chunks — Notes (SQLite + IndexedDB)
     <span id="dbStatus" class="tag">DB: starting…</span>
   </h1>
 
   <div class="app">
+    <!-- LEFT -->
     <div class="panel" id="tree">
       <div class="row">
         <input id="newSubject" type="text" placeholder="New subject name"/>
@@ -54,6 +55,7 @@ a.link{color:#8fb5ff;text-decoration:none}
       <div id="subjects"></div>
     </div>
 
+    <!-- RIGHT -->
     <div class="panel details">
       <header>
         <div>
@@ -72,7 +74,7 @@ a.link{color:#8fb5ff;text-decoration:none}
           <div class="row">
             <label class="filelabel" for="imgInput">+ Add images</label>
             <input id="imgInput" type="file" accept="image/*" multiple/>
-            <span class="small">Images are stored privately in OPFS</span>
+            <span class="small">Images are stored privately in IndexedDB</span>
           </div>
           <div id="imageList" class="scroll-x"></div>
         </div>
@@ -91,20 +93,12 @@ a.link{color:#8fb5ff;text-decoration:none}
   </div>
 </div>
 
-<script>
-if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('./sw.js', { scope: './' })
-    .catch(e => console.warn('SW registration failed', e));
-}
-</script>
-
 <script type="module">
 (async () => {
   const statusEl = document.getElementById('dbStatus');
-  const SQLITE_BASE = './lib/sqlite/';
+  const SQLJS_BASE = './lib/sqljs/';
 
-  const set = (t)=>{ statusEl.textContent=t; console.log(t); };
-
+  // ---------- tiny loader ----------
   function loadScript(url){
     return new Promise((resolve,reject)=>{
       const s=document.createElement('script'); s.src=url; s.async=true;
@@ -112,131 +106,115 @@ if ('serviceWorker' in navigator) {
       document.head.appendChild(s);
     });
   }
-  const withTimeout = (p, ms, label='timeout') =>
-    Promise.race([p, new Promise((_,rej)=>setTimeout(()=>rej(new Error(label)), ms))]);
+  const set = (t)=>{ statusEl.textContent=t; console.log(t); };
 
-  // ---------- Open SQLite (robust OPFS + fallbacks) ----------
-  let sqlite3, db, mode='?';
-  try{
-    set('DB: loading sqlite3.js…');
-    if(!('sqlite3InitModule' in self)) await loadScript(SQLITE_BASE + 'sqlite3.js');
+  // ---------- IndexedDB helpers ----------
+  const IDB_NAME = 'study-notes-idb';
+  const STORE_SQLITE = 'sqlite';
+  const STORE_IMAGES = 'images';
+  const idb = await new Promise((resolve,reject)=>{
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db=req.result;
+      if(!db.objectStoreNames.contains(STORE_SQLITE)) db.createObjectStore(STORE_SQLITE);
+      if(!db.objectStoreNames.contains(STORE_IMAGES)) db.createObjectStore(STORE_IMAGES);
+    };
+    req.onsuccess = ()=>resolve(req.result);
+    req.onerror = ()=>reject(req.error);
+  });
+  const idbGet = (store,key)=> new Promise((res,rej)=>{
+    const tx=idb.transaction(store,'readonly').objectStore(store).get(key);
+    tx.onsuccess=()=>res(tx.result); tx.onerror=()=>rej(tx.error);
+  });
+  const idbSet = (store,key,value)=> new Promise((res,rej)=>{
+    const tx=idb.transaction(store,'readwrite').objectStore(store).put(value,key);
+    tx.onsuccess=()=>res(); tx.onerror=()=>rej(tx.error);
+  });
+  const idbDel = (store,key)=> new Promise((res,rej)=>{
+    const tx=idb.transaction(store,'readwrite').objectStore(store).delete(key);
+    tx.onsuccess=()=>res(); tx.onerror=()=>rej(tx.error);
+  });
 
-    set('DB: loading WASM…');
-    sqlite3 = await withTimeout(
-      self.sqlite3InitModule({ locateFile: f => SQLITE_BASE + f }),
-      10000, 'WASM init timed out'
+  // ---------- load sql.js, open DB from IDB ----------
+  set('DB: loading sql.js…');
+  await loadScript(SQLJS_BASE + 'sql-wasm.js');
+  const SQL = await window.initSqlJs({ locateFile: f => SQLJS_BASE + f });
+
+  set('DB: opening from IndexedDB…');
+  const existing = await idbGet(STORE_SQLITE, 'main'); // ArrayBuffer | undefined
+  const db = existing ? new SQL.Database(new Uint8Array(existing))
+                      : new SQL.Database();
+
+  // schema (first-run)
+  db.exec(`
+    create table if not exists subjects(
+      id integer primary key,
+      name text unique not null,
+      created_at integer default (strftime('%s','now'))
     );
+    create table if not exists topics(
+      id integer primary key,
+      subject_id integer not null references subjects(id) on delete cascade,
+      name text not null,
+      created_at integer default (strftime('%s','now'))
+    );
+    create table if not exists chunks(
+      id integer primary key,
+      topic_id integer not null references topics(id) on delete cascade,
+      name text not null,
+      created_at integer default (strftime('%s','now'))
+    );
+    create table if not exists notes(
+      id integer primary key,
+      scope text not null check(scope in ('topic','chunk')),
+      scope_id integer not null,
+      kind text not null check(kind in ('image','pdf')),
+      title text,
+      path text,  -- key for images in IDB
+      url text,   -- for PDF links
+      created_at integer default (strftime('%s','now'))
+    );
+    create index if not exists idx_notes_scope on notes(scope,scope_id);
+  `);
 
-    const DB_FILE = 'notes.db';
-    const hasOPFS = !!(navigator.storage && navigator.storage.getDirectory);
-
-    set('DB: opening…');
-    if (hasOPFS) {
-      try {
-        if (sqlite3?.oo1?.OpfsDb) {
-          db = new sqlite3.oo1.OpfsDb(DB_FILE,'c');      // persistent
-          mode = 'OPFS';
-        } else {
-          db = new sqlite3.oo1.DB('file:'+DB_FILE+'?vfs=opfs','c'); // persistent
-          mode = 'opfs vfs';
-        }
-      } catch (e) {
-        console.warn('OPFS open failed, using transient DB:', e);
-        db = new sqlite3.oo1.DB('/session.db','c');      // non-persistent fallback
-        mode = 'non-persistent';
-      }
-    } else {
-      db = new sqlite3.oo1.DB('/session.db','c');        // non-persistent
-      mode = 'non-persistent';
-    }
-
-    db.exec('pragma foreign_keys=on;');
-    db.exec(`
-      create table if not exists subjects(
-        id integer primary key,
-        name text unique not null,
-        created_at integer default (strftime('%s','now'))
-      );
-      create table if not exists topics(
-        id integer primary key,
-        subject_id integer not null references subjects(id) on delete cascade,
-        name text not null,
-        created_at integer default (strftime('%s','now'))
-      );
-      create table if not exists chunks(
-        id integer primary key,
-        topic_id integer not null references topics(id) on delete cascade,
-        name text not null,
-        created_at integer default (strftime('%s','now'))
-      );
-      create table if not exists notes(
-        id integer primary key,
-        scope text not null check(scope in ('topic','chunk')),
-        scope_id integer not null,
-        kind text not null check(kind in ('image','pdf')),
-        title text,
-        path text,
-        url text,
-        created_at integer default (strftime('%s','now'))
-      );
-      create index if not exists idx_notes_scope on notes(scope,scope_id);
-    `);
-    set('DB: OK ('+mode+')');
-  }catch(e){
-    statusEl.textContent = 'DB error: ' + (e?.message || e);
-    console.error(e);
-    return;
+  // save DB to IDB (debounced)
+  let saveTimer;
+  async function saveDB(){
+    const data = db.export(); // Uint8Array
+    await idbSet(STORE_SQLITE, 'main', data);
   }
+  function scheduleSave(){ clearTimeout(saveTimer); saveTimer = setTimeout(saveDB, 300); }
+
+  set('DB: OK (IndexedDB)');
 
   // ---------- DB wrapper ----------
   const driver = {
     exec(sql, bind){
-      if(bind){
-        const st = db.prepare(sql);
-        try{ st.bind(bind); st.step(); } finally{ st.free(); }
-      } else { db.exec(sql); }
+      const st = db.prepare(sql);
+      try{
+        if(bind) st.bind(bind);
+        // step through (even for non-select) to finish statement
+        while(st.step()) {/* no rows */}
+      } finally { st.free(); }
+      scheduleSave();
     },
     select(sql, bind){
-      const rows = [];
-      if(bind){
-        const st = db.prepare(sql);
-        try{ st.bind(bind); while(st.step()) rows.push(st.get({rowMode:'object'})); }
-        finally{ st.free(); }
-      } else {
-        db.exec({sql, rowMode:'object', callback:r=>rows.push(r)});
-      }
+      const rows=[];
+      const st=db.prepare(sql);
+      try{
+        if(bind) st.bind(bind);
+        while(st.step()) rows.push(st.getAsObject());
+      } finally { st.free(); }
       return rows;
     }
   };
 
-  // ---------- OPFS helpers (for images) ----------
-  const HAS_OPFS = !!(navigator.storage && navigator.storage.getDirectory);
-  async function opfsRoot(){ return await navigator.storage.getDirectory(); }
-  async function ensureDir(parts){ let d=await opfsRoot(); for(const p of parts){ d=await d.getDirectoryHandle(p,{create:true}); } return d; }
-  async function writeBlob(path, blob){
-    const parts = path.split('/').filter(Boolean);
-    const fname = parts.pop();
-    const dir = await ensureDir(parts);
-    const fh = await dir.getFileHandle(fname,{create:true});
-    const w = await fh.createWritable(); await w.write(blob); await w.close();
-  }
-  async function rmFile(path){
-    const parts = path.split('/').filter(Boolean);
-    const fname = parts.pop();
-    let d = await opfsRoot();
-    for(const p of parts){ d = await d.getDirectoryHandle(p,{create:false}); }
-    await d.removeEntry(fname).catch(()=>{});
-  }
-  async function readFile(path){
-    const parts = path.split('/').filter(Boolean);
-    const fname = parts.pop();
-    let d = await opfsRoot();
-    for(const p of parts){ d = await d.getDirectoryHandle(p,{create:false}); }
-    const fh = await d.getFileHandle(fname);
-    return await fh.getFile();
-  }
+  // ---------- Image storage in IndexedDB ----------
+  async function writeBlob(path, blob){ await idbSet(STORE_IMAGES, path, blob); }
+  async function rmFile(path){ await idbDel(STORE_IMAGES, path); }
+  async function readFile(path){ return await idbGet(STORE_IMAGES, path); } // returns Blob
 
-  // ---------- UI state / render / actions (unchanged) ----------
+  // ---------- UI state ----------
   const subjectsEl = document.getElementById('subjects');
   const details = {
     scope:null, id:null,
@@ -264,6 +242,7 @@ if ('serviceWorker' in navigator) {
     if(scope) loadNotes();
   }
 
+  // ---------- Render tree ----------
   async function loadTree(){
     const subs = driver.select(`select id,name from subjects order by created_at asc`);
     subjectsEl.innerHTML='';
@@ -316,6 +295,7 @@ if ('serviceWorker' in navigator) {
     `).join('');
   }
 
+  // ---------- Left pane actions ----------
   subjectsEl.addEventListener('click', async (e)=>{
     const el = e.target.closest('button, h3, .chunk-pill'); if(!el) return;
     const act = el.dataset.act, id = Number(el.dataset.id);
@@ -388,12 +368,14 @@ if ('serviceWorker' in navigator) {
     }catch(err){ alert(err.message); }
   });
 
+  // ---------- Top bar actions ----------
   document.getElementById('addSubject').addEventListener('click', async ()=>{
     const name=(document.getElementById('newSubject').value||'').trim(); if(!name) return;
     driver.exec(`insert into subjects(name) values(?)`, [name]);
     document.getElementById('newSubject').value=''; loadTree();
   });
 
+  // ---------- Detail actions ----------
   document.getElementById('renameBtn').addEventListener('click', async ()=>{
     if(!details.scope) return;
     const tbl = details.scope==='topic'?'topics':'chunks';
@@ -419,18 +401,13 @@ if ('serviceWorker' in navigator) {
   // ---------- Notes UI ----------
   const imageList = document.getElementById('imageList');
   const pdfList = document.getElementById('pdfList');
-  const HAS_OPFS = !!(navigator.storage && navigator.storage.getDirectory);
-  if(!HAS_OPFS){
-    document.getElementById('imgInput').disabled = true;
-    document.querySelector('label[for="imgInput"]').textContent = 'Images disabled (no OPFS)';
-  }
 
   document.getElementById('imgInput').addEventListener('change', async (e)=>{
-    if(!details.scope || !HAS_OPFS) return;
+    if(!details.scope) return;
     for(const f of [...e.target.files]){
       const ext=(f.name.split('.').pop()||'png').toLowerCase();
       const id=crypto.randomUUID();
-      const path=`/images/${details.scope}/${details.id}/${id}.${ext}`;
+      const path=`/images/${details.scope}/${details.id}/${id}.${ext}`; // key in IDB
       await writeBlob(path,f);
       driver.exec(`insert into notes(scope,scope_id,kind,title,path) values(?,?,?,?,?)`,
         [details.scope,details.id,'image',f.name,path]);
@@ -452,14 +429,11 @@ if ('serviceWorker' in navigator) {
     imageList.innerHTML=''; pdfList.innerHTML='';
     const imgs = driver.select(`select id,title,path from notes where scope=? and scope_id=? and kind='image' order by id desc`, [details.scope,details.id]);
     for(const r of imgs){
-      let url = '';
-      if(HAS_OPFS){
-        const file = await readFile(r.path).catch(()=>null);
-        url = file ? URL.createObjectURL(file) : '';
-      }
+      const blob = await readFile(r.path).catch(()=>null);
+      const url = blob ? URL.createObjectURL(blob) : '';
       const card = document.createElement('div'); card.className='card';
       card.innerHTML = `
-        ${url?`<img src="${url}" alt="${esc(r.title||'image')}"/>`:`<div class="small">Image unavailable</div>`}
+        ${url?`<img src="${url}" alt="${esc(r.title||'image')}"/>`:`<div class="small">Missing image</div>`}
         <input type="text" value="${esc(r.title||'')}" placeholder="Caption" class="cap" data-id="${r.id}"/>
         <div class="row" style="margin-top:6px">
           <button class="ghost slim" data-act="save-cap" data-id="${r.id}">Save</button>
@@ -494,7 +468,7 @@ if ('serviceWorker' in navigator) {
       driver.exec(`update notes set title=? where id=?`, [cap,id]);
     } else if(b.dataset.act==='del-img'){
       if(!confirm('Delete image?')) return;
-      if(HAS_OPFS) await rmFile(b.dataset.path);
+      await rmFile(b.dataset.path);
       driver.exec(`delete from notes where id=?`, [id]);
       loadNotes();
     }
@@ -513,8 +487,8 @@ if ('serviceWorker' in navigator) {
     }
   });
 
+  // initial render
   loadTree();
-  try{ await navigator.storage.persist(); }catch{}
 })();
 </script>
 </body>
