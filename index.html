@@ -50,13 +50,14 @@ a.link{color:#8fb5ff;text-decoration:none}
 .lightbox-close{
   position:fixed; top:10px; right:10px;
   background:#fff; border:0; border-radius:999px;
-  width:36px; height:36px; font-weight:900; cursor:pointer
+  width:36px; height:36px; font-weight:900; cursor:pointer;
+  z-index:10001; /* keep above image/viewport */
 }
 .lightbox .viewport{
   position:absolute; inset:0; overflow:auto;
   -webkit-overflow-scrolling:touch;
   display:flex; align-items:center; justify-content:center;
-  padding:16px; touch-action:auto;
+  padding:16px; touch-action:auto; z-index:10000;
 }
 .lightbox img{
   max-width:95vw; max-height:95vh; display:block;
@@ -630,9 +631,18 @@ if ('serviceWorker' in navigator) {
       lb.zoom = 1;
     }
 
-    lb.closeBtn.addEventListener('click', closeLightbox);
+    // BACKDROP clicks: close when clicking outside the viewport or on empty viewport space
     lb.el.addEventListener('click', (e)=>{ if (e.target === lb.el) closeLightbox(); });
+    lb.vp.addEventListener('click', (e)=>{ if (e.target === lb.vp) closeLightbox(); });
+
     document.addEventListener('keydown', (e)=>{ if(e.key === 'Escape') closeLightbox(); });
+
+    // Close button: zoom out first, then close if already at 1x
+    lb.closeBtn.addEventListener('click', (e)=>{
+      e.stopPropagation();
+      if (lb.zoom > 1) { lb.zoom = 1; updateZoom(); }
+      else { closeLightbox(); }
+    });
 
     // Double-tap / double-click to toggle zoom (1x <-> 2.2x)
     let lastTap = 0, tapTimer = null;
