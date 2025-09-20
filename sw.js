@@ -1,13 +1,11 @@
-/* sw.tech.js – TECH Notes (SQLite + IndexedDB)
+/* sw.js – Study-notes (SQLite + IndexedDB)
    - Precaches core assets for offline use
    - Network-first for HTML (fresh deploys)
    - Cache-first for static assets (js/wasm/css/img)
    - Same-origin GET requests only
 */
 
-const APP_NS = 'tech';               // <— unique namespace for this app
-const CACHE_NAME = `study-notes-${APP_NS}-v1`;
-
+const CACHE_NAME = 'study-notes-v1';
 const CORE_ASSETS = [
   './',
   './index.html',
@@ -25,13 +23,13 @@ self.addEventListener('install', (event) => {
   );
 });
 
-// --- Activate: clean old caches for THIS namespace only ---
+// --- Activate: clean old caches ---
 self.addEventListener('activate', (event) => {
   event.waitUntil((async () => {
     const keys = await caches.keys();
     await Promise.all(
       keys
-        .filter((k) => k !== CACHE_NAME && k.startsWith(`study-notes-${APP_NS}-`))
+        .filter((k) => k !== CACHE_NAME && k.startsWith('study-notes-'))
         .map((k) => caches.delete(k))
     );
     await self.clients.claim();
@@ -101,4 +99,4 @@ self.addEventListener('fetch', (event) => {
 
     return cached || networkPromise;
   })());
-});
+}); 
