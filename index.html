@@ -15,7 +15,8 @@ h1{font-size:18px;margin:0 0 12px}
 .app{display:grid;grid-template-columns:420px 1fr;gap:16px} @media(max-width:960px){.app{grid-template-columns:1fr}}
 .panel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-input[type=text],input[type=url]{width:100%;padding:10px 12px;border-radius:12px;border:1px solid var(--line);background:#0b1020;color:var(--ink)}
+/* ⬇ also style password inputs */
+input[type=text],input[type=url],input[type=password]{width:100%;padding:10px 12px;border-radius:12px;border:1px solid var(--line);background:#0b1020;color:var(--ink)}
 button{padding:10px 14px;border:0;border-radius:14px;background:var(--accent);color:#081225;font-weight:600;cursor:pointer}
 button.ghost{background:#232a48;color:var(--ink)} button.warn{background:var(--bad);color:#200} button.slim{padding:6px 10px;border-radius:10px}
 hr{border:0;border-top:1px dashed var(--line);margin:12px 0}
@@ -72,6 +73,27 @@ a.link{color:#8fb5ff;text-decoration:none}
         <input id="newSubject" type="text" placeholder="New subject name"/>
         <button id="addSubject">+ Subject</button>
       </div>
+
+      <!-- ✅ New: CouchDB panel -->
+      <div class="subject">
+        <header><h2 style="margin:0">CouchDB</h2></header>
+        <div class="row">
+          <input id="couchUrl" type="url" placeholder="https://couch.techstudy.me"/>
+          <input id="couchDb" type="text" placeholder="db name (notes)"/>
+        </div>
+        <div class="row">
+          <input id="couchUser" type="text" placeholder="user"/>
+          <input id="couchPass" type="password" placeholder="password"/>
+        </div>
+        <div class="row">
+          <button class="ghost slim" id="couchSave">Save</button>
+          <button class="ghost slim" id="couchTest">Test</button>
+          <button id="couchSync">Sync now</button>
+        </div>
+        <div class="small" id="couchMsg"></div>
+      </div>
+      <!-- /CouchDB panel -->
+
       <div id="subjects"></div>
     </div>
 
@@ -632,6 +654,141 @@ if ('serviceWorker' in navigator) {
   lbStack.addEventListener('gesturestart', e=>{ e.preventDefault(); });
   lbStack.addEventListener('gesturechange', e=>{ e.preventDefault(); lbZoom=Math.min(6,Math.max(1,e.scale)); lbUpdateZoom(); });
   lbStack.addEventListener('gestureend', e=>{ e.preventDefault(); });
+
+  /* ---------- CouchDB Sync (NEW) ---------- */
+  const couchCfgKey = 'couchCfg';
+  const couchMsg = () => document.getElementById('couchMsg');
+
+  const couch = {
+    cfg: JSON.parse(localStorage.getItem(couchCfgKey) || '{}'),
+    save(){ localStorage.setItem(couchCfgKey, JSON.stringify(this.cfg)); },
+    authHeader(){
+      if (this.cfg.user && this.cfg.pass) return 'Basic ' + btoa(this.cfg.user + ':' + this.cfg.pass);
+      return null;
+    },
+    base(){
+      if(!this.cfg.url || !this.cfg.db) throw new Error('Set Couch URL and DB first.');
+      return this.cfg.url.replace(/\/+$/,'') + '/' + encodeURIComponent(this.cfg.db);
+    },
+    async ensureDb(){
+      const ah = this.authHeader();
+      const r = await fetch(this.base(), {
+        method: 'PUT',
+        headers: ah ? { Authorization: ah } : {},
+        credentials: 'include'
+      });
+      if (r.status !== 201 && r.status !== 412) throw new Error(await r.text());
+    },
+    async fetchJson(path, opts = {}){
+      const ah = this.authHeader();
+      const headers = Object.assign(
+        { 'Accept': 'application/json' },
+        opts.headers || {},
+        ah ? { 'Authorization': ah } : {}
+      );
+      const res = await fetch(this.base() + path, {
+        ...opts,
+        headers,
+        credentials: 'include'
+      });
+      if (!res.ok) throw new Error(await res.text());
+      return res.json();
+    },
+    async head(path){
+      const ah = this.authHeader();
+      return fetch(this.base() + path, {
+        method: 'HEAD',
+        headers: ah ? { 'Authorization': ah } : {},
+        credentials: 'include'
+      });
+    }
+  };
+
+  function hydrateCouchForm(){
+    const {url='', db='', user=''} = couch.cfg;
+    document.getElementById('couchUrl').value = url || '';
+    document.getElementById('couchDb').value  = db  || '';
+    document.getElementById('couchUser').value= user|| '';
+    document.getElementById('couchPass').value= '';
+  }
+  hydrateCouchForm();
+
+  document.getElementById('couchSave').addEventListener('click', ()=>{
+    couch.cfg.url  = document.getElementById('couchUrl').value.trim();
+    couch.cfg.db   = document.getElementById('couchDb').value.trim();
+    couch.cfg.user = document.getElementById('couchUser').value.trim();
+    const pw       = document.getElementById('couchPass').value;
+    if (pw) couch.cfg.pass = pw; // keep existing if left blank
+    couch.save();
+    couchMsg().textContent = 'Saved Couch settings.';
+  });
+
+  document.getElementById('couchTest').addEventListener('click', async ()=>{
+    try{
+      await couch.ensureDb();
+      const info = await couch.fetchJson('');
+      couchMsg().textContent = `OK: ${info.db_name} (doc count ${info.doc_count})`;
+    }catch(err){ couchMsg().textContent = 'Test failed: ' + err.message; }
+  });
+
+  async function upsertDoc(id, body){
+    let rev = null;
+    const probe = await couch.head('/' + encodeURIComponent(id));
+    if (probe.ok) rev = probe.headers.get('ETag')?.replaceAll('"','') || null;
+    const payload = Object.assign({ _id: id }, rev ? { _rev: rev } : {}, body);
+    const res = await couch.fetchJson('/' + encodeURIComponent(id), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    return res.rev;
+  }
+  async function putAttachment(docId, name, blob, rev){
+    const ah = couch.authHeader();
+    const res = await fetch(
+      couch.base() + '/' + encodeURIComponent(docId) + '/' + encodeURIComponent(name) + '?rev=' + encodeURIComponent(rev),
+      { method:'PUT', body: blob, headers: Object.assign({ 'Content-Type': blob.type||'application/octet-stream' }, ah?{Authorization:ah}:{}) , credentials:'include' }
+    );
+    if(!res.ok) throw new Error(await res.text());
+    const j = await res.json();
+    return j.rev;
+  }
+
+  async function syncAllToCouch(){
+    couchMsg().textContent = 'Syncing…';
+    await couch.ensureDb();
+
+    for (const s of driver.select(`select id,name,created_at from subjects`)){
+      await upsertDoc(`subject:${s.id}`, {type:'subject', ...s});
+    }
+    for (const t of driver.select(`select id,subject_id,name,created_at from topics`)){
+      await upsertDoc(`topic:${t.id}`, {type:'topic', ...t});
+    }
+    for (const c of driver.select(`select id,topic_id,name,created_at from chunks`)){
+      await upsertDoc(`chunk:${c.id}`, {type:'chunk', ...c});
+    }
+    for (const n of driver.select(`select id,scope,scope_id,kind,title,path,url,created_at from notes`)){
+      const docId = `note:${n.id}`;
+      let rev = await upsertDoc(docId, {type:'note', ...n});
+      if (n.kind === 'image'){
+        const pages = driver.select(`select page,path from image_pages where note_id=? order by page asc`, [n.id]);
+        for (const p of pages){
+          const blob = await readFile(p.path).catch(()=>null);
+          if(!blob) continue;
+          const ext = (blob.type && blob.type.includes('/') ? blob.type.split('/')[1] : 'bin');
+          const name = `p${p.page}.${ext}`;
+          rev = await putAttachment(docId, name, blob, rev);
+        }
+      }
+    }
+
+    const info = await couch.fetchJson('');
+    couchMsg().textContent = `Sync done. Docs: ${info.doc_count}`;
+  }
+  document.getElementById('couchSync').addEventListener('click', ()=>{
+    syncAllToCouch().catch(err=>{ couchMsg().textContent = 'Sync failed: ' + err.message; });
+  });
+  /* ---------- /CouchDB Sync ---------- */
 
   /* init */
   setStatus('DB: OK (IndexedDB)');
