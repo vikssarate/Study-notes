@@ -58,6 +58,7 @@ a.link{color:#8fb5ff;text-decoration:none}
   <h1>
     Subjects → Topics → Chunks — Notes (SQLite + IndexedDB)
     <span id="dbStatus" class="tag">DB: starting…</span>
+    <span id="netTag" class="tag">Online</span>
   </h1>
 
   <div class="app">
@@ -82,6 +83,7 @@ a.link{color:#8fb5ff;text-decoration:none}
           <button class="ghost slim" id="couchSave">Save</button>
           <button class="ghost slim" id="couchTest">Test</button>
           <button id="couchSync">Sync now</button>
+          <button class="ghost slim" id="couchPull">Pull now</button>
         </div>
         <div class="small" id="couchMsg"></div>
       </div>
@@ -142,12 +144,15 @@ if ('serviceWorker' in navigator) {
 <script type="module">
 (async () => {
   const statusEl = document.getElementById('dbStatus');
+  const netTag = document.getElementById('netTag');
   const SQLJS_BASE = './lib/sqljs/';
   const setStatus = (t, ok=true) => {
     statusEl.textContent = t;
     statusEl.style.borderColor = ok ? 'var(--line)' : 'var(--bad)';
     if (ok && t.includes('Saved')) setTimeout(()=>{ statusEl.textContent = 'DB: OK (IndexedDB)'; }, 800);
   };
+  const setNet = () => netTag.textContent = navigator.onLine ? 'Online' : 'Offline';
+  setNet(); window.addEventListener('online', setNet); window.addEventListener('offline', setNet);
   const esc = s => (s??'').replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[m]));
 
   function loadScript(url){
@@ -451,7 +456,6 @@ if ('serviceWorker' in navigator) {
         for(const tid of topicIds) queue(`topic:${tid}`,'topic','delete',null);
         queue(`subject:${id}`,'subject','delete',null);
 
-        /* local delete + blobs */
         for(const nid of noteIds){ await deleteImageNoteCascade(nid); }
         driver.exec(`delete from subjects where id=?`, [id]);
         collapsed.subjects.delete(id); saveCollapse();
@@ -636,7 +640,6 @@ if ('serviceWorker' in navigator) {
       await writeBlob(path,f);
       driver.exec(`insert into image_pages(note_id,page,path) values(?,?,?)`, [noteId,next++,path]);
     }
-    /* queue note re-upsert to push attachments */
     const n = driver.select(`select id,scope,scope_id,kind,title,path,url,created_at from notes where id=?`, [noteId])[0];
     if(n) queue(`note:${n.id}`,'note','upsert',n);
     fi.value=''; loadNotes();
@@ -753,13 +756,28 @@ if ('serviceWorker' in navigator) {
         ah ? { 'Authorization': ah } : {}
       );
       const res = await fetch(this.base() + path, { ...opts, headers, credentials: 'include' });
-      if (!res.ok) throw new Error(await res.text());
+      if (!res.ok) {
+        const text = await res.text();
+        // Show friendly hints for common cases
+        if (res.status===401) throw new Error('Unauthorized: check user/pass (and DB Permissions Members).');
+        if (res.status===403) throw new Error('Forbidden: your user cannot access this DB.');
+        if (res.status===404 && path==='/') throw new Error('DB not found (wrong name?)');
+        throw new Error(text);
+      }
       return res.json();
     },
     async head(path){
       const ah = this.authHeader();
       return fetch(this.base() + path, {
         method: 'HEAD',
+        headers: ah ? { 'Authorization': ah } : {},
+        credentials: 'include'
+      });
+    },
+    async get(path){
+      const ah = this.authHeader();
+      return fetch(this.base() + path, {
+        method: 'GET',
         headers: ah ? { 'Authorization': ah } : {},
         credentials: 'include'
       });
@@ -794,18 +812,46 @@ if ('serviceWorker' in navigator) {
     }catch(err){ couchMsg().textContent = 'Test failed: ' + err.message; }
   });
 
-  async function upsertDoc(id, body){
+  async function getRevViaHeadOrGet(id){
+    // Try HEAD for ETag (rev). If not available (proxies/CORS), fall back to GET.
     let rev = null;
     const probe = await couch.head('/' + encodeURIComponent(id));
     if (probe.ok) rev = probe.headers.get('ETag')?.replaceAll('"','') || null;
+    if (!rev && probe.status===404) return null;
+    if (!rev) {
+      const g = await couch.get('/' + encodeURIComponent(id));
+      if (g.ok) {
+        const j = await g.json().catch(()=>null);
+        rev = j && j._rev ? j._rev : null;
+      }
+    }
+    return rev;
+  }
+
+  async function upsertDoc(id, body){
+    let rev = getRev(id) || await getRevViaHeadOrGet(id);
     const payload = Object.assign({ _id: id }, rev ? { _rev: rev } : {}, body);
-    const res = await couch.fetchJson('/' + encodeURIComponent(id), {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    });
-    setRev(id, res.rev);
-    return res.rev;
+    try{
+      const res = await couch.fetchJson('/' + encodeURIComponent(id), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      setRev(id, res.rev);
+      return res.rev;
+    }catch(e){
+      // Retry once on conflict by pulling latest rev and resubmitting
+      if (String(e).includes('conflict')){
+        const latest = await getRevViaHeadOrGet(id);
+        const pay2 = Object.assign({ _id:id }, latest?{_rev:latest}:{}, body);
+        const res2 = await couch.fetchJson('/' + encodeURIComponent(id), {
+          method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(pay2)
+        });
+        setRev(id, res2.rev);
+        return res2.rev;
+      }
+      throw e;
+    }
   }
   async function putAttachment(docId, name, blob, rev){
     const ah = couch.authHeader();
@@ -820,38 +866,40 @@ if ('serviceWorker' in navigator) {
   }
 
   async function syncAllToCouch(){ // manual button
-    couchMsg().textContent = 'Syncing…';
-    await couch.ensureDb();
+    try{
+      couchMsg().textContent = 'Syncing…';
+      await couch.ensureDb();
 
-    for (const s of driver.select(`select id,name,created_at from subjects`)){
-      await upsertDoc(`subject:${s.id}`, {type:'subject', ...s});
-    }
-    for (const t of driver.select(`select id,subject_id,name,created_at from topics`)){
-      await upsertDoc(`topic:${t.id}`, {type:'topic', ...t});
-    }
-    for (const c of driver.select(`select id,topic_id,name,created_at from chunks`)){
-      await upsertDoc(`chunk:${c.id}`, {type:'chunk', ...c});
-    }
-    for (const n of driver.select(`select id,scope,scope_id,kind,title,path,url,created_at from notes`)){
-      const docId = `note:${n.id}`;
-      let rev = await upsertDoc(docId, {type:'note', ...n});
-      if (n.kind === 'image'){
-        const pages = driver.select(`select page,path from image_pages where note_id=? order by page asc`, [n.id]);
-        for (const p of pages){
-          const blob = await readFile(p.path).catch(()=>null);
-          if(!blob) continue;
-          const ext = (blob.type && blob.type.includes('/') ? blob.type.split('/')[1] : 'bin');
-          const name = `p${p.page}.${ext}`;
-          rev = await putAttachment(docId, name, blob, rev);
+      for (const s of driver.select(`select id,name,created_at from subjects`)){
+        await upsertDoc(`subject:${s.id}`, {type:'subject', ...s});
+      }
+      for (const t of driver.select(`select id,subject_id,name,created_at from topics`)){
+        await upsertDoc(`topic:${t.id}`, {type:'topic', ...t});
+      }
+      for (const c of driver.select(`select id,topic_id,name,created_at from chunks`)){
+        await upsertDoc(`chunk:${c.id}`, {type:'chunk', ...c});
+      }
+      for (const n of driver.select(`select id,scope,scope_id,kind,title,path,url,created_at from notes`)){
+        const docId = `note:${n.id}`;
+        let rev = await upsertDoc(docId, {type:'note', ...n});
+        if (n.kind === 'image'){
+          const pages = driver.select(`select page,path from image_pages where note_id=? order by page asc`, [n.id]);
+          for (const p of pages){
+            const blob = await readFile(p.path).catch(()=>null);
+            if(!blob) continue;
+            const ext = (blob.type && blob.type.includes('/') ? blob.type.split('/')[1] : 'bin');
+            rev = await putAttachment(docId, `p${p.page}.${ext}`, blob, rev);
+          }
         }
       }
+      const info = await couch.fetchJson('');
+      couchMsg().textContent = `Sync done. Docs: ${info.doc_count}`;
+    }catch(err){
+      couchMsg().textContent = 'Sync failed: ' + err.message;
     }
-    const info = await couch.fetchJson('');
-    couchMsg().textContent = `Sync done. Docs: ${info.doc_count}`;
   }
-  document.getElementById('couchSync').addEventListener('click', ()=>{
-    syncAllToCouch().catch(err=>{ couchMsg().textContent = 'Sync failed: ' + err.message; });
-  });
+  document.getElementById('couchSync').addEventListener('click', ()=>syncAllToCouch());
+  document.getElementById('couchPull').addEventListener('click', ()=>pullOnce(true));
 
   /* ---------- AUTO PUSH LOOP ---------- */
   let pushTimer=null, pushing=false;
@@ -863,20 +911,13 @@ if ('serviceWorker' in navigator) {
       for(const r of rows){
         try{
           if(r.action==='delete'){
-            const rev = getRev(r.doc_id);
-            if(!rev){
-              // try to HEAD to get current rev; if 404, nothing to delete
-              const head = await couch.head('/'+encodeURIComponent(r.doc_id));
-              if(head.ok){
-                const et = head.headers.get('ETag')?.replaceAll('"','')||null;
-                if(et) setRev(r.doc_id, et);
-              }
+            let rev = getRev(r.doc_id) || await getRevViaHeadOrGet(r.doc_id);
+            if(!rev) { // nothing to delete
+              driver.exec(`delete from sync_outbox where id=?`, [r.id]);
+              continue;
             }
-            const cur = getRev(r.doc_id);
-            if(cur){
-              const j = await couch.fetchJson('/'+encodeURIComponent(r.doc_id)+'?rev='+encodeURIComponent(cur), { method:'DELETE' });
-              setRev(r.doc_id, j.rev);
-            }
+            const j = await couch.fetchJson('/'+encodeURIComponent(r.doc_id)+'?rev='+encodeURIComponent(rev), { method:'DELETE' });
+            setRev(r.doc_id, j.rev);
           }else{ // upsert
             const body = r.payload ? JSON.parse(r.payload) : {};
             let rev = await upsertDoc(r.doc_id, {type:r.doc_type, ...body});
@@ -886,16 +927,14 @@ if ('serviceWorker' in navigator) {
                 const blob = await readFile(p.path).catch(()=>null);
                 if(!blob) continue;
                 const ext = (blob.type && blob.type.includes('/') ? blob.type.split('/')[1] : 'bin');
-                const name = `p${p.page}.${ext}`;
-                rev = await putAttachment(r.doc_id, name, blob, rev);
+                rev = await putAttachment(r.doc_id, `p${p.page}.${ext}`, blob, rev);
               }
             }
           }
           driver.exec(`delete from sync_outbox where id=?`, [r.id]);
         }catch(errRow){
-          // leave row in outbox; try later
           console.warn('push row failed', errRow);
-          break;
+          break; // leave it for retry later
         }
       }
     }catch(e){ /* network/auth issue; will retry */ }
@@ -923,10 +962,7 @@ if ('serviceWorker' in navigator) {
       if(type==='subject') driver.exec(`delete from subjects where id=?`, [Number(nid)]);
       if(type==='topic')   driver.exec(`delete from topics where id=?`, [Number(nid)]);
       if(type==='chunk')   driver.exec(`delete from chunks where id=?`, [Number(nid)]);
-      if(type==='note'){
-        // delete local files as well
-        await deleteImageNoteCascade(Number(nid));
-      }
+      if(type==='note'){ await deleteImageNoteCascade(Number(nid)); }
       setRev(id, doc._rev);
       return;
     }
@@ -965,21 +1001,30 @@ if ('serviceWorker' in navigator) {
     setRev(doc._id, doc._rev);
   }
 
+  async function pullOnce(manual=false){
+    try{
+      await couch.ensureDb();
+      const since = getSince();
+      const url = couch.base()+`/_changes?since=${encodeURIComponent(since)}&include_docs=true&attachments=false&att_encoding_info=true&feed=longpoll&timeout=${manual?0:60000}`;
+      const headers = couch.authHeader()?{Authorization:couch.authHeader()}:{};
+      const res = await fetch(url, { credentials:'include', headers });
+      if(!res.ok){ if(manual) throw new Error(await res.text()); return; }
+      const j = await res.json();
+      for(const ch of j.results){ if(ch.doc) await applyRemoteDoc(ch.doc); }
+      setSince(j.last_seq);
+      if(manual) couchMsg().textContent = 'Pulled changes.';
+      loadTree(); // reflect fresh data in UI
+      if(details.scope) setDetail(details.scope, details.id, details.titleEl.textContent);
+    }catch(err){
+      if(manual) couchMsg().textContent = 'Pull failed: ' + err.message;
+    }
+  }
+
   async function pullLoop(){
     if(pulling) return; pulling = true;
     while(true){
-      try{
-        await couch.ensureDb();
-        const since = getSince();
-        const url = couch.base()+`/_changes?since=${encodeURIComponent(since)}&include_docs=true&attachments=false&att_encoding_info=true&feed=longpoll&timeout=60000`;
-        const res = await fetch(url, { credentials:'include', headers: couch.authHeader()?{Authorization:couch.authHeader()}:{} });
-        if(!res.ok){ await new Promise(r=>setTimeout(r,2000)); continue; }
-        const j = await res.json();
-        for(const ch of j.results){ if(ch.doc) await applyRemoteDoc(ch.doc); }
-        setSince(j.last_seq);
-      }catch(err){
-        await new Promise(r=>setTimeout(r,3000));
-      }
+      await pullOnce(false);
+      await new Promise(r=>setTimeout(r, 800)); // tiny gap
     }
   }
 
