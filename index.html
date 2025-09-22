@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
-<title>Subjects → Topics → Chunks — Notes (SQLite + IndexedDB)</title>
+<title>GsStudy — Subjects → Topics → Chunks — Notes (SQLite + IndexedDB)</title>
 <meta name="apple-mobile-web-app-capable" content="yes"/>
 <style>
 :root{--bg:#0f1220;--card:#181c2f;--ink:#eef1ff;--muted:#9aa3c7;--line:#2a3052;--ok:#7bd88f;--bad:#ff7575;--accent:#6ca8ff}
@@ -12,7 +12,8 @@ body{margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,-apple
 .wrap{max-width:1200px;margin:0 auto;padding:12px}
 h1{font-size:18px;margin:0 0 12px}
 .tag{display:inline-block;font-size:12px;background:#0b1128;border:1px solid var(--line);padding:2px 8px;border-radius:10px;margin-left:8px}
-.app{display:grid;grid-template-columns:420px 1fr;gap:16px} @media(max-width:960px){.app{grid-template-columns:1fr}}
+.app{display:grid;grid-template-columns:420px 1fr;gap:16px}
+@media(max-width:960px){.app{grid-template-columns:1fr}}
 .panel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 input[type=text],input[type=url],input[type=password]{width:100%;padding:10px 12px;border-radius:12px;border:1px solid var(--line);background:#0b1020;color:var(--ink)}
@@ -42,7 +43,6 @@ input[type=file]{display:none}
 a.link{color:#8fb5ff;text-decoration:none}
 .iconbtn{background:#232a48;color:var(--ink);border-radius:10px;padding:6px 10px}
 .icon{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
-
 /* Lightbox */
 .lightbox{position:fixed; inset:0; background:rgba(0,0,0,.92); display:none; z-index:9999}
 .lightbox.show{display:block}
@@ -56,7 +56,7 @@ a.link{color:#8fb5ff;text-decoration:none}
 <body>
 <div class="wrap">
   <h1>
-    Subjects → Topics → Chunks — Notes (SQLite + IndexedDB)
+    GsStudy — Subjects → Topics → Chunks — Notes (SQLite + IndexedDB)
     <span id="dbStatus" class="tag">DB: starting…</span>
     <span id="netTag" class="tag">Online</span>
   </h1>
@@ -72,10 +72,11 @@ a.link{color:#8fb5ff;text-decoration:none}
       <div class="subject">
         <header><h2 style="margin:0">CouchDB Sync</h2></header>
         <div class="row">
-          <input id="couchUrl" type="url" placeholder="https://couch.techstudy.me"/>
-          <input id="couchDb" type="text" placeholder="db name (notes)"/>
+          <input id="couchUrl" type="url" placeholder="https://couch.gsstudy.me"/>
+          <input id="couchDb" type="text" placeholder="db name (engineering)"/>
         </div>
-        <div class="row">
+        <!-- Hidden creds (DB is open). Remove style to show again. -->
+        <div class="row" id="credsRow" style="display:none">
           <input id="couchUser" type="text" placeholder="user"/>
           <input id="couchPass" type="password" placeholder="password"/>
         </div>
@@ -136,16 +137,17 @@ a.link{color:#8fb5ff;text-decoration:none}
 </div>
 
 <script>
+/* Register the GsStudy SW */
 if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('./sw.js', { scope: './' }).catch(()=>{});
+  navigator.serviceWorker.register('./sw.gsstudy.js', { scope: './' }).catch(()=>{});
 }
 </script>
 
 <script type="module">
 (async () => {
+  /* ---------- Status + utils ---------- */
   const statusEl = document.getElementById('dbStatus');
   const netTag = document.getElementById('netTag');
-  const SQLJS_BASE = './lib/sqljs/';
   const setStatus = (t, ok=true) => {
     statusEl.textContent = t;
     statusEl.style.borderColor = ok ? 'var(--line)' : 'var(--bad)';
@@ -155,6 +157,7 @@ if ('serviceWorker' in navigator) {
   setNet(); window.addEventListener('online', setNet); window.addEventListener('offline', setNet);
   const esc = s => (s??'').replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[m]));
 
+  /* ---------- Robust sql.js loader (local → CDN fallback) ---------- */
   function loadScript(url){
     return new Promise((resolve,reject)=>{
       const s=document.createElement('script'); s.src=url; s.async=true;
@@ -162,21 +165,45 @@ if ('serviceWorker' in navigator) {
       document.head.appendChild(s);
     });
   }
+  const SQL_CANDIDATES = [
+    { js: './lib/sqljs/sql-wasm.js', wasm: './lib/sqljs/sql-wasm.wasm' },
+    { js: 'https://cdn.jsdelivr.net/npm/sql.js@1.10.2/dist/sql-wasm.js',
+      wasm: 'https://cdn.jsdelivr.net/npm/sql.js@1.10.2/dist/sql-wasm.wasm' }
+  ];
+  let SQL = null;
+  for (const src of SQL_CANDIDATES) {
+    try {
+      await loadScript(src.js);
+      SQL = await window.initSqlJs({ locateFile: () => src.wasm });
+      break;
+    } catch (err) {
+      console.warn('sql.js load failed from', src.js, err);
+    }
+  }
+  if (!SQL) { setStatus('DB init failed: could not load sql.js', false); throw new Error('sql.js not available'); }
 
-  /* ---------- IndexedDB ---------- */
-  const IDB_NAME = 'study-notes-idb';
+  /* ---------- IndexedDB (GsStudy namespace) ---------- */
+  const IDB_NAME = 'study-notes-idb-gsstudy';
   const STORE_SQLITE = 'sqlite';
   const STORE_IMAGES = 'images';
-  const idb = await new Promise((resolve,reject)=>{
-    const req = indexedDB.open(IDB_NAME, 1);
-    req.onupgradeneeded = () => {
-      const db=req.result;
-      if(!db.objectStoreNames.contains(STORE_SQLITE)) db.createObjectStore(STORE_SQLITE);
-      if(!db.objectStoreNames.contains(STORE_IMAGES)) db.createObjectStore(STORE_IMAGES);
-    };
-    req.onsuccess = ()=>resolve(req.result);
-    req.onerror = ()=>reject(req.error);
-  });
+
+  let idb;
+  try {
+    idb = await new Promise((resolve,reject)=>{
+      if (!('indexedDB' in window)) return reject(new Error('IndexedDB not supported (Private mode?)'));
+      const req = indexedDB.open(IDB_NAME, 1);
+      req.onupgradeneeded = () => {
+        const db=req.result;
+        if(!db.objectStoreNames.contains(STORE_SQLITE)) db.createObjectStore(STORE_SQLITE);
+        if(!db.objectStoreNames.contains(STORE_IMAGES)) db.createObjectStore(STORE_IMAGES);
+      };
+      req.onsuccess = ()=>resolve(req.result);
+      req.onerror   = ()=>reject(req.error || new Error('IndexedDB open failed'));
+    });
+  } catch (e) {
+    setStatus('IndexedDB error: ' + (e?.message || e), false);
+    throw e;
+  }
   const idbGet = (store,key)=> new Promise((res,rej)=>{
     const tx=idb.transaction(store,'readonly').objectStore(store).get(key);
     tx.onsuccess=()=>res(tx.result); tx.onerror=()=>rej(tx.error);
@@ -190,9 +217,7 @@ if ('serviceWorker' in navigator) {
     tx.onsuccess=()=>res(); tx.onerror=()=>rej(tx.error);
   });
 
-  /* ---------- sql.js ---------- */
-  await loadScript(SQLJS_BASE + 'sql-wasm.js');
-  const SQL = await window.initSqlJs({ locateFile: f => SQLJS_BASE + f });
+  /* ---------- Open / create SQLite DB ---------- */
   const raw = await idbGet(STORE_SQLITE, 'main');
   const db = raw ? new SQL.Database(raw instanceof Uint8Array ? raw : new Uint8Array(raw)) : new SQL.Database();
 
@@ -234,7 +259,6 @@ if ('serviceWorker' in navigator) {
       created_at integer default (strftime('%s','now')),
       unique(note_id,page)
     );
-
     /* --- Auto-sync bookkeeping --- */
     create table if not exists sync_outbox(
       id integer primary key,
@@ -443,7 +467,6 @@ if ('serviceWorker' in navigator) {
 
       } else if(act==='del-subj'){
         if(!confirm('Delete subject and everything under it?')) return;
-        /* queue deletes for all children first */
         const topicIds = driver.select(`select id from topics where subject_id=?`, [id]).map(x=>x.id);
         const chunkIds = driver.select(`select c.id from chunks c join topics t on c.topic_id=t.id where t.subject_id=?`, [id]).map(x=>x.id);
         const noteIds  = driver.select(`
@@ -455,7 +478,6 @@ if ('serviceWorker' in navigator) {
         for(const cid of chunkIds) queue(`chunk:${cid}`,'chunk','delete',null);
         for(const tid of topicIds) queue(`topic:${tid}`,'topic','delete',null);
         queue(`subject:${id}`,'subject','delete',null);
-
         for(const nid of noteIds){ await deleteImageNoteCascade(nid); }
         driver.exec(`delete from subjects where id=?`, [id]);
         collapsed.subjects.delete(id); saveCollapse();
@@ -481,7 +503,6 @@ if ('serviceWorker' in navigator) {
         for(const nid of noteIds) queue(`note:${nid}`,'note','delete',null);
         for(const cid of chunkIds) queue(`chunk:${cid}`,'chunk','delete',null);
         queue(`topic:${id}`,'topic','delete',null);
-
         for(const nid of noteIds){ await deleteImageNoteCascade(nid); }
         driver.exec(`delete from topics where id=?`, [id]);
         collapsed.topics.delete(id); saveCollapse();
@@ -628,6 +649,7 @@ if ('serviceWorker' in navigator) {
     }
   }
 
+  /* ✅ Single, correct pages uploader (the bad one is removed) */
   imageList.addEventListener('change', async (e)=>{
     const fi = e.target.closest('input[type=file][data-act="add-pages"]');
     if(!fi) return;
@@ -725,7 +747,7 @@ if ('serviceWorker' in navigator) {
   }
 
   /* ---------- CouchDB Sync (Save/Test/Sync + AUTO) ---------- */
-  const couchCfgKey = 'couchCfg';
+  const couchCfgKey = 'couchCfg-gsstudy';
   const couchMsg = () => document.getElementById('couchMsg');
 
   const couch = {
@@ -742,11 +764,13 @@ if ('serviceWorker' in navigator) {
     async ensureDb(){
       const ah = this.authHeader();
       const r = await fetch(this.base(), {
-        method: 'PUT',
+        method: 'GET',
         headers: ah ? { Authorization: ah } : {},
         credentials: 'include'
       });
-      if (r.status !== 201 && r.status !== 412) throw new Error(await r.text());
+      if (r.status === 404) throw new Error('DB not found. Create it once on the server.');
+      if (!r.ok) throw new Error(await r.text());
+      return r.json().catch(()=>null);
     },
     async fetchJson(path, opts = {}){
       const ah = this.authHeader();
@@ -758,10 +782,8 @@ if ('serviceWorker' in navigator) {
       const res = await fetch(this.base() + path, { ...opts, headers, credentials: 'include' });
       if (!res.ok) {
         const text = await res.text();
-        // Show friendly hints for common cases
-        if (res.status===401) throw new Error('Unauthorized: check user/pass (and DB Permissions Members).');
-        if (res.status===403) throw new Error('Forbidden: your user cannot access this DB.');
-        if (res.status===404 && path==='/') throw new Error('DB not found (wrong name?)');
+        if (res.status===401) throw new Error('Unauthorized: check credentials or DB permissions.');
+        if (res.status===403) throw new Error('Forbidden: user cannot access this DB.');
         throw new Error(text);
       }
       return res.json();
@@ -783,6 +805,12 @@ if ('serviceWorker' in navigator) {
       });
     }
   };
+
+  // Prefill on first run (URL/DB only – no password)
+  if (!couch.cfg.url && !couch.cfg.db) {
+    couch.cfg = { url: 'https://couch.gsstudy.me', db: 'engineering', user: '' };
+    couch.save();
+  }
 
   function hydrateCouchForm(){
     const {url='', db='', user=''} = couch.cfg;
@@ -806,14 +834,13 @@ if ('serviceWorker' in navigator) {
 
   document.getElementById('couchTest').addEventListener('click', async ()=>{
     try{
-      await couch.ensureDb();
-      const info = await couch.fetchJson('');
-      couchMsg().textContent = `OK: ${info.db_name} (doc count ${info.doc_count})`;
+      const info = await couch.ensureDb();
+      const dbInfo = info || await couch.fetchJson('');
+      couchMsg().textContent = `OK: ${dbInfo.db_name} (doc count ${dbInfo.doc_count})`;
     }catch(err){ couchMsg().textContent = 'Test failed: ' + err.message; }
   });
 
   async function getRevViaHeadOrGet(id){
-    // Try HEAD for ETag (rev). If not available (proxies/CORS), fall back to GET.
     let rev = null;
     const probe = await couch.head('/' + encodeURIComponent(id));
     if (probe.ok) rev = probe.headers.get('ETag')?.replaceAll('"','') || null;
@@ -840,7 +867,6 @@ if ('serviceWorker' in navigator) {
       setRev(id, res.rev);
       return res.rev;
     }catch(e){
-      // Retry once on conflict by pulling latest rev and resubmitting
       if (String(e).includes('conflict')){
         const latest = await getRevViaHeadOrGet(id);
         const pay2 = Object.assign({ _id:id }, latest?{_rev:latest}:{}, body);
@@ -865,7 +891,7 @@ if ('serviceWorker' in navigator) {
     return j.rev;
   }
 
-  async function syncAllToCouch(){ // manual button
+  async function syncAllToCouch(){
     try{
       couchMsg().textContent = 'Syncing…';
       await couch.ensureDb();
@@ -912,13 +938,10 @@ if ('serviceWorker' in navigator) {
         try{
           if(r.action==='delete'){
             let rev = getRev(r.doc_id) || await getRevViaHeadOrGet(r.doc_id);
-            if(!rev) { // nothing to delete
-              driver.exec(`delete from sync_outbox where id=?`, [r.id]);
-              continue;
-            }
+            if(!rev) { driver.exec(`delete from sync_outbox where id=?`, [r.id]); continue; }
             const j = await couch.fetchJson('/'+encodeURIComponent(r.doc_id)+'?rev='+encodeURIComponent(rev), { method:'DELETE' });
             setRev(r.doc_id, j.rev);
-          }else{ // upsert
+          }else{
             const body = r.payload ? JSON.parse(r.payload) : {};
             let rev = await upsertDoc(r.doc_id, {type:r.doc_type, ...body});
             if(r.doc_type==='note' && body.kind==='image'){
@@ -934,7 +957,7 @@ if ('serviceWorker' in navigator) {
           driver.exec(`delete from sync_outbox where id=?`, [r.id]);
         }catch(errRow){
           console.warn('push row failed', errRow);
-          break; // leave it for retry later
+          break;
         }
       }
     }catch(e){ /* network/auth issue; will retry */ }
@@ -946,7 +969,7 @@ if ('serviceWorker' in navigator) {
     window.addEventListener('online', pushOnce);
   }
 
-  /* ---------- AUTO PULL LOOP (long-poll _changes) ---------- */
+  /* ---------- AUTO PULL LOOP ---------- */
   let pulling=false;
   async function fetchAttachment(docId, name){
     const ah = couch.authHeader();
@@ -985,7 +1008,6 @@ if ('serviceWorker' in navigator) {
                    on conflict(id) do update set scope=excluded.scope, scope_id=excluded.scope_id, kind=excluded.kind,
                      title=excluded.title, path=excluded.path, url=excluded.url, created_at=excluded.created_at`,
         [doc.id, doc.scope, doc.scope_id, doc.kind, doc.title||'', doc.path||'', doc.url||'', doc.created_at||Math.floor(Date.now()/1000)]);
-
       if(doc._attachments){
         for(const name of Object.keys(doc._attachments)){
           const blob = await fetchAttachment(doc._id, name);
@@ -1013,21 +1035,19 @@ if ('serviceWorker' in navigator) {
       for(const ch of j.results){ if(ch.doc) await applyRemoteDoc(ch.doc); }
       setSince(j.last_seq);
       if(manual) couchMsg().textContent = 'Pulled changes.';
-      loadTree(); // reflect fresh data in UI
+      loadTree();
       if(details.scope) setDetail(details.scope, details.id, details.titleEl.textContent);
     }catch(err){
       if(manual) couchMsg().textContent = 'Pull failed: ' + err.message;
     }
   }
-
   async function pullLoop(){
     if(pulling) return; pulling = true;
     while(true){
       await pullOnce(false);
-      await new Promise(r=>setTimeout(r, 800)); // tiny gap
+      await new Promise(r=>setTimeout(r, 800));
     }
   }
-
   function maybeStartAutoSync(){
     if(couch.cfg?.url && couch.cfg?.db){
       startPushLoop();
